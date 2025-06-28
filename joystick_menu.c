@@ -1,514 +1,331 @@
-/*
- * This example code creates a simple menu navigable by joystick input.
- * It dynamically lists ROMs from a file and launches them via MAME.
- *
- * This code is public domain. Feel free to use it for any purpose!
- */
-
-#define SDL_MAIN_USE_CALLBACKS 1 /* use the callbacks instead of main() */
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
-#include <SDL3/SDL_events.h> // Required for SDL_Event and SDL_PushEvent
 #include <SDL3_image/SDL_image.h>
-#include <stdio.h> // For printf and SDL_Log, FILE operations
-#include <string.h> // For strcspn, strcmp, strtok_r (more portable than strsep)
-#include <stdlib.h> // For system, strtol, malloc, free
-#include <errno.h> // For errno and strerror
-#include <dirent.h> // For directory scanning
-#include <sys/stat.h> // For stat (to check if it's a file)
+#include <SDL3_ttf/SDL_ttf.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
-// --- Global Variables and Constants ---
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
-static SDL_Texture *menu_logo_texture = NULL;
+static SDL_Texture *logo_texture = NULL;
 static SDL_Texture *background_texture = NULL;
+static TTF_Font *font = NULL;
 
-// Struct to hold details for each ROM menu item
-typedef struct RomMenuItem {
-    char *display_name;   // e.g., "Super Mario World (USA)"
-    char *mame_system;    // e.g., "snes" or "null" for arcade games (short mame system name)
-    char *rom_full_path;  // e.g., "/Users/.../Super Mario World (USA).sfc"
-} RomMenuItem;
+#define INPUT_COOLDOWN_MS 200
+#define AXIS_DEADZONE 8000
+#define LOGO_HEIGHT 120
+#define FONT_SIZE 18
 
-static RomMenuItem *rom_menu_items = NULL;
-static int rom_menu_item_count = 0;
-static int selected_option_index = 0;
-
-// Cooldown for joystick axis/hat movement to prevent rapid scrolling
-#define INPUT_COOLDOWN_MS 200 // 200 milliseconds between actionable inputs
 static Uint64 last_input_time = 0;
 
-// Threshold for joystick axis motion (value from -32768 to 32767)
-#define AXIS_DEADZONE 8000 // Ignore small movements, require significant push
+// -------- System Menu --------
+typedef struct {
+    const char *dir_name;
+    const char *display_name;
+    const char *mame_sys;
+    const char *launch_arg;
+    const char *allowed_exts;
+} SystemEntry;
 
-// --- Function Prototypes ---
+static const SystemEntry systems[] = {
+    { "sms1", "Master System",   "sms1",   "-cart",  "sms,bin" },
+    { "genesis", "Mega Drive",   "genesis","-cart",  "md,bin" },
+    { "snes", "Super Nintendo",  "snes",   "-cart",  "smc,sfc" },
+    { "nes", "Nintendo 8-bit",   "nes",    "-cart",  "nes" },
+    { "segacd", "Mega CD",       "segacd", "-cdrom", "cue,chd" },
+};
+
+static int selected_system_index = 0;
+static int system_scroll_offset = 0;
+static int in_rom_menu = 0;
+
+// -------- ROM Menu --------
+typedef struct {
+    char *display_name;
+    char *rom_path;
+} RomEntry;
+
+static RomEntry *rom_list = NULL;
+static int rom_count = 0;
+static int selected_rom_index = 0;
+static int rom_scroll_offset = 0;
+
+// -------- Function Prototypes --------
+static void draw_system_menu(void);
+static void draw_rom_menu(void);
+static void load_rom_list(const SystemEntry *sys);
+static void free_rom_list(void);
 static void handle_joystick_input(const SDL_Event *event);
-static void draw_menu(void);
-static int scan_rom_directory(const char *dir_path);
-static void cleanup_rom_list(void);
+static int has_allowed_extension(const char *filename, const char *allowed_exts);
+static void render_text_centered(const char *text, float y, SDL_Color color);
 
-// --- SDL Callbacks (required for SDL_MAIN_USE_CALLBACKS) ---
-
-/* This function runs once at startup. */
-SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
-{
-    // Initialize SDL subsystems: Video for display, Joystick for input
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK)) {
-        SDL_Log("Couldn't initialize SDL: %s", SDL_GetError());
-        return SDL_APP_FAILURE;
+int main(int argc, char *argv[]) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) < 0) {
+        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        return 1;
     }
 
-    // Create a window and a 2D rendering context
-    // Using dimensions and title from the original working example
-    if (!SDL_CreateWindowAndRenderer("examples/input/joystick-events", 640, 480, 0, &window, &renderer)) {
-        SDL_Log("Couldn't create window/renderer: %s", SDL_GetError());
-        SDL_Quit(); // Quit SDL if window/renderer creation fails
-        return SDL_APP_FAILURE;
+    if (TTF_Init() < 0) {
+        SDL_Log("TTF_Init failed: %s", SDL_GetError());
+        return 1;
     }
 
-    menu_logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
+    if (SDL_CreateWindowAndRenderer("Joystick Menu", 640, 480, 0, &window, &renderer) < 0) {
+        SDL_Log("Window/Renderer creation failed: %s", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
     
-    if (!menu_logo_texture) {
-        SDL_Log("Couldn't load logo image: %s", SDL_GetError());
-    } else {
-        SDL_Log("Logo image loaded successfully.");
+    if (!font) {
+        SDL_Log("Failed to load font: %s", SDL_GetError());
+        return 1;
     }
 
-    // Load background image
+    logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
     background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
-    
-    if (!background_texture) {
-        SDL_Log("Could not load background image: %s", SDL_GetError());
-    } else {
-        // Enable blending for the texture
-        SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
-
-        // Set the overall opacity (0 = transparent, 255 = opaque)
-        SDL_SetTextureAlphaMod(background_texture, 80); // 50% opacity
-    }
-
-    // Scan ROMs from the specified directory
-    // Assuming a 'roms' subfolder relative to the executable
-    if (scan_rom_directory("./roms/") != 0) {
-        SDL_Log("Failed to scan ROM directory. Menu might be empty.");
-    } else {
-        SDL_Log("Successfully scanned %d ROMs.", rom_menu_item_count);
-    }
-
-    SDL_Log("SDL App Initialized successfully.");
-    return SDL_APP_CONTINUE; /* carry on with the program! */
-}
-
-/* This function runs when a new event (mouse input, keypresses, etc) occurs. */
-SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
-{
-    if (event->type == SDL_EVENT_QUIT) {
-        return SDL_APP_SUCCESS; /* end the program, reporting success to the OS. */
-    } else if (event->type == SDL_EVENT_JOYSTICK_ADDED) {
-        // Handle a new joystick being plugged in or already connected at startup
-        const SDL_JoystickID which = event->jdevice.which;
-        SDL_Joystick *joystick = SDL_OpenJoystick(which);
-        
-        if (!joystick) {
-            SDL_Log("Joystick #%u add, but not opened: %s", (unsigned int)which, SDL_GetError());
-        } else {
-            SDL_Log("Joystick #%u ('%s') added and opened.", (unsigned int)which, SDL_GetJoystickName(joystick));
-        }
-    } else if (event->type == SDL_EVENT_JOYSTICK_REMOVED) {
-        // Handle a joystick being unplugged
-        const SDL_JoystickID which = event->jdevice.which;
-        SDL_Joystick *joystick = SDL_GetJoystickFromID(which); // Get the pointer if it's still valid
-        
-        if (joystick) {
-            SDL_CloseJoystick(joystick); // Close the joystick device
-        }
-
-        SDL_Log("Joystick #%u removed.", (unsigned int)which);
-    } else {
-        // Pass relevant joystick events to our custom handler
-        handle_joystick_input(event);
-    }
-
-    return SDL_APP_CONTINUE; /* carry on with the program! */
-}
-
-/* This function runs once per frame, and is the heart of the program. */
-SDL_AppResult SDL_AppIterate(void *appstate)
-{
-    // Clear the renderer with a black color
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_RenderClear(renderer);
-
-    // Draw the menu (now uses dynamically loaded ROMs)
-    draw_menu();
-
-    // Present the rendered content to the window
-    SDL_RenderPresent(renderer);
-
-    return SDL_APP_CONTINUE; /* carry on with the program! */
-}
-
-/* This function runs once at shutdown. */
-void SDL_AppQuit(void *appstate, SDL_AppResult result)
-{
-    // Clean up dynamically allocated ROM menu items
-    cleanup_rom_list();
-
-    if (menu_logo_texture) {
-        SDL_DestroyTexture(menu_logo_texture);
-        menu_logo_texture = NULL;
-    }
 
     if (background_texture) {
-        SDL_DestroyTexture(background_texture);
-        background_texture = NULL;
+        SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureAlphaMod(background_texture, 80);
     }
 
-    // SDL will clean up the window/renderer automatically when using SDL_MAIN_USE_CALLBACKS.
-    // Explicitly quitting SDL ensures all subsystems are deinitialized.
-    SDL_Log("SDL App Quitting with result: %d", (int)result);
+    SDL_Event event;
+    int running = 1;
+
+    while (running) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT) {
+                running = 0;
+            }
+            if (event.type == SDL_EVENT_JOYSTICK_ADDED) {
+                SDL_Joystick *joy = SDL_OpenJoystick(event.jdevice.which);
+                if (joy) SDL_Log("Joystick added: %s", SDL_GetJoystickName(joy));
+            }
+            if (event.type == SDL_EVENT_JOYSTICK_REMOVED) {
+                SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));
+            }
+            handle_joystick_input(&event);
+        }
+
+        int win_w, win_h;
+        SDL_GetWindowSize(window, &win_w, &win_h);
+
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        if (background_texture) {
+            SDL_FRect dst = { 0, 0, (float)win_w, (float)win_h };
+            SDL_RenderTexture(renderer, background_texture, NULL, &dst);
+        }
+
+        if (logo_texture) {
+            SDL_FRect dst = { (win_w - 200) / 2.0f, 20.0f, 200.0f, 100.0f };
+            SDL_RenderTexture(renderer, logo_texture, NULL, &dst);
+        }
+
+        if (in_rom_menu)
+            draw_rom_menu();
+        else
+            draw_system_menu();
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay(16);
+    }
+
+    free_rom_list();
+    TTF_CloseFont(font);
+    SDL_DestroyTexture(logo_texture);
+    SDL_DestroyTexture(background_texture);
+    TTF_Quit();
     SDL_Quit();
+    return 0;
 }
 
-// --- Custom Functions for Menu Logic and Drawing ---
+static void render_text_centered(const char *text, float y, SDL_Color color) {
+    SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
+    if (!surface) return;
 
-// handle_joystick_input: Processes joystick events for menu navigation
-static void handle_joystick_input(const SDL_Event *event)
-{
-    Uint64 now = SDL_GetTicks();
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+    int text_w = surface->w;
+    int text_h = surface->h;
+    SDL_DestroySurface(surface);
 
-    // Apply cooldown to prevent multiple selections/movements from a single brief input
-    // This is especially important for analog stick movements.
-    if (now < last_input_time + INPUT_COOLDOWN_MS) {
-        return;
-    }
+    int win_w;
+    SDL_GetWindowSize(window, &win_w, NULL);
 
-    switch (event->type) {
-        case SDL_EVENT_JOYSTICK_AXIS_MOTION: {
-            // Check for Y-axis (axis 1 is common for vertical stick movement)
-            if (event->jaxis.axis == 1) {
-                // Corrected logic for UP/DOWN
-                if (event->jaxis.value < -AXIS_DEADZONE) { // Moved Up
-                    if (rom_menu_item_count > 0) {
-                        selected_option_index = (selected_option_index - 1 + rom_menu_item_count) % rom_menu_item_count;
-                        last_input_time = now;
-                    }
-                } else if (event->jaxis.value > AXIS_DEADZONE) { // Moved Down
-                    if (rom_menu_item_count > 0) {
-                        selected_option_index = (selected_option_index + 1) % rom_menu_item_count;
-                        last_input_time = now;
-                    }
-                }
-            }
-            break;
-        }
-        case SDL_EVENT_JOYSTICK_HAT_MOTION: {
-            // Handle D-pad (hat) movements - Corrected logic for UP/DOWN
-            if (event->jhat.value == SDL_HAT_UP) {
-                if (rom_menu_item_count > 0) {
-                    selected_option_index = (selected_option_index - 1 + rom_menu_item_count) % rom_menu_item_count;
-                    last_input_time = now;
-                }
-            } else if (event->jhat.value == SDL_HAT_DOWN) {
-                if (rom_menu_item_count > 0) {
-                    selected_option_index = (selected_option_index + 1) % rom_menu_item_count;
-                    last_input_time = now;
-                }
-            }
-            break;
-        }
-        case SDL_EVENT_JOYSTICK_BUTTON_DOWN: {
-            // Handle button press for selection (Button 0 is often 'A'/'X')
-            if (event->jbutton.button == 0) {
-                if (rom_menu_item_count > 0 && selected_option_index < rom_menu_item_count) {
-                    RomMenuItem *selected_item = &rom_menu_items[selected_option_index];
-
-                    if (selected_item->display_name && strcmp(selected_item->display_name, "Exit") == 0) {
-                        SDL_Log("Selected: Exit. Quitting application.");
-                        SDL_Event quit_event;
-                        quit_event.type = SDL_EVENT_QUIT;
-                        quit_event.quit.timestamp = SDL_GetTicks();
-                        SDL_PushEvent(&quit_event);
-                    } else {
-                        SDL_Log("Selected: %s", selected_item->display_name);
-
-                        // --- Launch MAME instance ---
-                        char command_buffer[2048]; // Sufficiently large buffer for the command
-                        //const char *mame_executable_path = "/Users/auser/Downloads/mame-mame0277/mame"; // <-- VERIFY THIS PATH!
-                        const char *mame_executable_path = "mame"; // <-- VERIFY THIS PATH!
-
-                        if (selected_item->mame_system && strcmp(selected_item->mame_system, "null") == 0) { // Arcade game
-                            // For arcade, MAME expects the short name (e.g., 'pacman') and -rompath to the directory.
-                            // Need to extract the filename (short name) and its parent directory from rom_full_path.
-                            const char *rom_file_name_ptr = SDL_strrchr(selected_item->rom_full_path, '/');
-                            if (rom_file_name_ptr) {
-                                rom_file_name_ptr++; // Move past the slash to get the actual filename
-                            } else {
-                                rom_file_name_ptr = selected_item->rom_full_path; // No slash, assume it's just the filename
-                            }
-
-                            // Duplicate the rom_full_path to get the directory
-                            char *rom_directory_temp = SDL_strdup(selected_item->rom_full_path);
-                            if (!rom_directory_temp) {
-                                SDL_Log("Memory allocation failed for rom_directory_temp.");
-                                return;
-                            }
-                            char *last_slash = SDL_strrchr(rom_directory_temp, '/');
-                            if (last_slash) {
-                                *last_slash = '\0'; // Null-terminate to get the directory path
-                            } else {
-                                // If no slash, it means the rom_path itself is just a filename,
-                                // so assume current directory.
-                                SDL_strlcpy(rom_directory_temp, ".", 2);
-                            }
-
-                            // Extract base name (without extension) for MAME's short name
-                            char rom_short_name[256];
-                            SDL_strlcpy(rom_short_name, rom_file_name_ptr, sizeof(rom_short_name));
-                            char *dot = SDL_strrchr(rom_short_name, '.');
-                            
-                            if (dot) {
-                                *dot = '\0'; // Null-terminate at the dot to remove extension
-                            }
-
-                            SDL_snprintf(command_buffer, sizeof(command_buffer),
-                                         "\"%s\" -rompath \"%s\" %s",
-                                         mame_executable_path, rom_directory_temp, rom_short_name);
-                            SDL_free(rom_directory_temp); // Free duplicated string
-                        } else { // Console game (e.g., SNES, Genesis)
-                            // MAME Console Command: <mame_exe> <system_name> -cart <full_rom_path>
-                            SDL_snprintf(command_buffer, sizeof(command_buffer),
-                                         "\"%s\" %s -cart \"%s\"",
-                                         mame_executable_path, selected_item->mame_system, selected_item->rom_full_path);
-                        }
-
-                        SDL_Log("Executing command: %s", command_buffer);
-                        int ret = system(command_buffer); // Execute the command
-                        
-                        if (ret == -1) {
-                            SDL_Log("Error launching MAME: %s", strerror(errno));
-                        } else if (ret != 0) {
-                            SDL_Log("MAME exited with non-zero status: %d", ret);
-                        } else {
-                            SDL_Log("MAME launched successfully.");
-                        }
-                    }
-                }
-                last_input_time = now;
-            }
-            break;
-        }
-        default:
-            // Ignore other joystick events not relevant to menu navigation
-            break;
-    }
+    SDL_FRect dst = { (win_w - text_w) / 2.0f, y, (float)text_w, (float)text_h };
+    SDL_RenderTexture(renderer, texture, NULL, &dst);
+    SDL_DestroyTexture(texture);
 }
 
-// draw_menu: Renders the menu options on the screen
-static void draw_menu(void)
-{
+static void draw_system_menu(void) {
     int win_w, win_h;
     SDL_GetWindowSize(window, &win_w, &win_h);
 
-    if (menu_logo_texture) {
-        SDL_FRect dst;
-        dst.w = 250.0f;  // desired width
-        dst.h = 150.0f;  // desired height
-        dst.x = (win_w - dst.w) / 2.0f; // center horizontally
-        dst.y = 20.0f;   // fixed Y position
+    int item_count = sizeof(systems) / sizeof(SystemEntry) + 1;
+    int line_height = FONT_SIZE + 10;
+    int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
 
-        SDL_RenderTexture(renderer, menu_logo_texture, NULL, &dst);
-    }
+    if (selected_system_index < system_scroll_offset)
+        system_scroll_offset = selected_system_index;
+    if (selected_system_index >= system_scroll_offset + visible_lines)
+        system_scroll_offset = selected_system_index - visible_lines + 1;
 
-    // Calculate vertical starting position to center the menu
-    int line_height = SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE + 10;
-    int total_menu_height = rom_menu_item_count * line_height;
-    int start_y = (win_h - total_menu_height) / 2;
+    int start_y = LOGO_HEIGHT + 20;
 
-    for (int i = 0; i < rom_menu_item_count; ++i) {
-        Uint8 text_color_r = 225, text_color_g = 225, text_color_b = 225; // Default: Light gray
+    for (int i = 0; i < item_count; ++i) {
+        if (i < system_scroll_offset) continue;
+        if (i >= system_scroll_offset + visible_lines) break;
 
-        // Highlight the currently selected option
-        if (i == selected_option_index) {
-            text_color_r = 255;
-            text_color_g = 255;
-            text_color_b = 0; // Selected: Yellow
-        }
+        SDL_Color color = { 200, 200, 200, 255 };
+        if (i == selected_system_index)
+            color.r = color.g = 255;
 
-        SDL_SetRenderDrawColor(renderer, text_color_r, text_color_g, text_color_b, 255);
-
-        // Calculate X position for centering text horizontally
-        float text_width = SDL_strlen(rom_menu_items[i].display_name) * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE;
-        float x = (win_w - text_width) / 2.0f;
-        float y = (float)(start_y + i * line_height);
-
-        // Render the text using SDL's debug text function
-        SDL_RenderDebugText(renderer, x, y, rom_menu_items[i].display_name);
-    }
-
-    // Render background image if available
-    if (background_texture) {
-        SDL_FRect dst = { 0, 0, (float)win_w, (float)win_h };
-        SDL_RenderTexture(renderer, background_texture, NULL, &dst);
+        const char *label = (i < item_count - 1) ? systems[i].display_name : "Exit";
+        render_text_centered(label, start_y + (i - system_scroll_offset) * line_height, color);
     }
 }
 
-// scan_rom_directory: Scans a directory for ROM files and populates the menu.
-static int scan_rom_directory(const char *dir_path) {
-    DIR *dir;
-    struct dirent *entry;
-    struct stat filestat;
-    char full_path[2048]; // Buffer for full file path
+static void draw_rom_menu(void) {
+    int win_w, win_h;
+    SDL_GetWindowSize(window, &win_w, &win_h);
 
-    // List of supported extensions and their corresponding MAME system names
-    // For arcade .zip/.7z, use "null" for mame_system
-    const struct {
-        const char *ext;
-        const char *mame_sys;
-    } supported_rom_types[] = {
-        { "nes", "nes" },
-        { "sfc", "snes" },
-        { "smc", "snes" },
-        { "smd", "genesis" },
-        { "sms", "sms1" },
-        { "md", "genesis" },
-        { "gen", "genesis" },
-        { "bin", "genesis" }, // Can be Genesis, or others - check context
-        { "zip", "null" },    // Assuming .zip is for arcade games
-        { "7z",  "null" },    // Assuming .7z is for arcade games
-        { "gb", "gameboy" },
-        { "gba", "gba" },
-        { "n64", "n64" },
-        { "ps1", "psx" },
-        // Add more as needed
-        { NULL, NULL } // Sentinel
-    };
+    int line_height = FONT_SIZE + 10;
+    int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
 
-    dir = opendir(dir_path);
+    if (selected_rom_index < rom_scroll_offset)
+        rom_scroll_offset = selected_rom_index;
+    if (selected_rom_index >= rom_scroll_offset + visible_lines)
+        rom_scroll_offset = selected_rom_index - visible_lines + 1;
 
-    if (!dir) {
-        SDL_Log("Error: Could not open ROM directory '%s': %s", dir_path, strerror(errno));
-        return -1;
+    int start_y = LOGO_HEIGHT + 20;
+
+    for (int i = 0; i < rom_count; ++i) {
+        if (i < rom_scroll_offset) continue;
+        if (i >= rom_scroll_offset + visible_lines) break;
+
+        SDL_Color color = { 200, 200, 200, 255 };
+        if (i == selected_rom_index)
+            color.r = color.g = 255;
+
+        render_text_centered(rom_list[i].display_name, start_y + (i - rom_scroll_offset) * line_height, color);
+    }
+}
+
+static void handle_joystick_input(const SDL_Event *event) {
+    Uint64 now = SDL_GetTicks();
+    if (now < last_input_time + INPUT_COOLDOWN_MS) return;
+
+    if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
+        int direction = 0;
+        if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
+        else if (event->jaxis.value > AXIS_DEADZONE) direction = 1;
+
+        if (direction) {
+            if (in_rom_menu)
+                selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
+            else {
+                int item_count = sizeof(systems) / sizeof(SystemEntry) + 1;
+                selected_system_index = (selected_system_index + item_count + direction) % item_count;
+            }
+            last_input_time = now;
+        }
     }
 
-    int capacity = 10;
-    rom_menu_items = (RomMenuItem *)SDL_calloc(capacity, sizeof(RomMenuItem));
-    
-    if (!rom_menu_items) {
-        SDL_Log("Memory allocation failed for ROM list during scan.");
-        closedir(dir);
-        return -1;
-    }
-    rom_menu_item_count = 0;
-
-    while ((entry = readdir(dir)) != NULL) {
-        // Skip '.' and '..'
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        SDL_snprintf(full_path, sizeof(full_path), "%s%s", dir_path, entry->d_name);
-
-        if (stat(full_path, &filestat) == -1) {
-            SDL_Log("Error stating file %s: %s", full_path, strerror(errno));
-            continue;
-        }
-
-        if (S_ISREG(filestat.st_mode)) { // Check if it's a regular file
-            const char *extension = SDL_strrchr(entry->d_name, '.');
-
-            if (extension) {
-                extension++; // Move past the dot
-
-                for (int i = 0; supported_rom_types[i].ext != NULL; ++i) {
-                    if (SDL_strcmp(extension, supported_rom_types[i].ext) == 0) {
-                        // Found a supported ROM type
-
-                        // Reallocate if needed
-                        if (rom_menu_item_count >= capacity) {
-                            capacity *= 2;
-
-                            RomMenuItem *new_items = (RomMenuItem *)SDL_realloc(rom_menu_items, capacity * sizeof(RomMenuItem));
-
-                            if (!new_items) {
-                                SDL_Log("Memory reallocation failed for ROM list during scan. Stopping.");
-                                closedir(dir);
-                                cleanup_rom_list(); // Clean up what was already allocated
-                                return -1;
-                            }
-
-                            rom_menu_items = new_items;
-                        }
-
-                        // Populate RomMenuItem
-                        rom_menu_items[rom_menu_item_count].display_name = SDL_strdup(entry->d_name);
-                        rom_menu_items[rom_menu_item_count].mame_system = SDL_strdup(supported_rom_types[i].mame_sys);
-                        rom_menu_items[rom_menu_item_count].rom_full_path = SDL_strdup(full_path);
-
-                        if (!rom_menu_items[rom_menu_item_count].display_name ||
-                            !rom_menu_items[rom_menu_item_count].mame_system ||
-                            !rom_menu_items[rom_menu_item_count].rom_full_path) {
-                            SDL_Log("Memory allocation failed for ROM item strings.");
-                            // Clean up partially allocated item
-                            SDL_free(rom_menu_items[rom_menu_item_count].display_name);
-                            SDL_free(rom_menu_items[rom_menu_item_count].mame_system);
-                            SDL_free(rom_menu_items[rom_menu_item_count].rom_full_path);
-                            continue; // Skip this ROM
-                        }
-                        rom_menu_item_count++;
-                        break; // Move to next directory entry
-                    }
-                }
+    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event->jbutton.button == 0) {
+        if (in_rom_menu) {
+            if (rom_list[selected_rom_index].rom_path == NULL) {
+                in_rom_menu = 0;
+                free_rom_list();
+            } else {
+                const SystemEntry *sys = &systems[selected_system_index];
+                char cmd[1024];
+                SDL_snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"",
+                    sys->mame_sys, sys->launch_arg, rom_list[selected_rom_index].rom_path);
+                system(cmd);
+                in_rom_menu = 0;
+                free_rom_list();
+            }
+        } else {
+            int item_count = sizeof(systems) / sizeof(SystemEntry);
+            if (selected_system_index == item_count) {
+                exit(0);
+            } else {
+                load_rom_list(&systems[selected_system_index]);
+                in_rom_menu = 1;
+                selected_rom_index = 0;
+                rom_scroll_offset = 0;
             }
         }
+        last_input_time = now;
+    }
+}
+
+static int has_allowed_extension(const char *filename, const char *allowed_exts) {
+    const char *dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return 0;
+
+    char ext[16];
+    SDL_strlcpy(ext, dot + 1, sizeof(ext));
+
+    char temp[64];
+    SDL_strlcpy(temp, allowed_exts, sizeof(temp));
+    char *token = strtok(temp, ",");
+
+    while (token) {
+        if (SDL_strcasecmp(ext, token) == 0)
+            return 1;
+        token = strtok(NULL, ",");
+    }
+    return 0;
+}
+
+static void load_rom_list(const SystemEntry *sys) {
+    free_rom_list();
+
+    char path[512];
+    SDL_snprintf(path, sizeof(path), "./roms/%s/", sys->dir_name);
+    DIR *dir = opendir(path);
+    if (!dir) return;
+
+    int capacity = 20;
+    rom_list = SDL_calloc(capacity, sizeof(RomEntry));
+    rom_count = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (entry->d_type != DT_REG) continue;
+        if (!has_allowed_extension(entry->d_name, sys->allowed_exts)) continue;
+
+        if (rom_count >= capacity) {
+            capacity *= 2;
+            rom_list = SDL_realloc(rom_list, capacity * sizeof(RomEntry));
+        }
+
+        rom_list[rom_count].display_name = SDL_strdup(entry->d_name);
+        SDL_snprintf(path, sizeof(path), "./roms/%s/%s", sys->dir_name, entry->d_name);
+        rom_list[rom_count].rom_path = SDL_strdup(path);
+        rom_count++;
     }
     closedir(dir);
 
-    // Add an "Exit" option at the end of the list
-    if (rom_menu_item_count >= capacity) {
-        capacity++; // Just need one more slot
-        RomMenuItem *new_items = (RomMenuItem *)SDL_realloc(rom_menu_items, capacity * sizeof(RomMenuItem));
-        if (!new_items) {
-            SDL_Log("Memory reallocation failed for Exit option.");
-            // Continue without an Exit option, or handle as fatal.
-        } else {
-            rom_menu_items = new_items;
-        }
-    }
-
-    if (rom_menu_items) { // Ensure rom_menu_items is not NULL before trying to add Exit
-        rom_menu_items[rom_menu_item_count].display_name = SDL_strdup("Exit");
-        rom_menu_items[rom_menu_item_count].mame_system = SDL_strdup("null"); // No system needed for Exit
-        rom_menu_items[rom_menu_item_count].rom_full_path = SDL_strdup("null"); // No path needed for Exit
-        
-        if (rom_menu_items[rom_menu_item_count].display_name &&
-            rom_menu_items[rom_menu_item_count].mame_system &&
-            rom_menu_items[rom_menu_item_count].rom_full_path) {
-            rom_menu_item_count++;
-        } else {
-            SDL_Log("Failed to allocate Exit option strings.");
-            SDL_free(rom_menu_items[rom_menu_item_count].display_name);
-            SDL_free(rom_menu_items[rom_menu_item_count].mame_system);
-            SDL_free(rom_menu_items[rom_menu_item_count].rom_full_path);
-        }
-    }
-
-    return 0; // Success
+    rom_list = SDL_realloc(rom_list, (rom_count + 1) * sizeof(RomEntry));
+    rom_list[rom_count].display_name = SDL_strdup("Exit");
+    rom_list[rom_count].rom_path = NULL;
+    rom_count++;
 }
 
-
-// cleanup_rom_list: Frees all dynamically allocated memory for ROM menu items.
-static void cleanup_rom_list(void) {
-    if (rom_menu_items) {
-        
-        for (int i = 0; i < rom_menu_item_count; ++i) {
-            SDL_free(rom_menu_items[i].display_name);
-            SDL_free(rom_menu_items[i].mame_system);
-            SDL_free(rom_menu_items[i].rom_full_path);
-        }
-
-        SDL_free(rom_menu_items);
-        rom_menu_items = NULL;
-        rom_menu_item_count = 0;
+static void free_rom_list(void) {
+    for (int i = 0; i < rom_count; ++i) {
+        SDL_free(rom_list[i].display_name);
+        SDL_free(rom_list[i].rom_path);
     }
+    SDL_free(rom_list);
+    rom_list = NULL;
+    rom_count = 0;
 }
