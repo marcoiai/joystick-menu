@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <SDL3_mixer/SDL_mixer.h>
+
+static Mix_Music *music = NULL;
 
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
@@ -17,7 +20,7 @@ static TTF_Font *font = NULL;
 #define INPUT_COOLDOWN_MS 200
 #define AXIS_DEADZONE 8000
 #define LOGO_HEIGHT 120
-#define FONT_SIZE 18
+#define FONT_SIZE 16
 
 static Uint64 last_input_time = 0;
 
@@ -61,19 +64,21 @@ static void free_rom_list(void);
 static void handle_joystick_input(const SDL_Event *event);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
 static void render_text_centered(const char *text, float y, SDL_Color color);
+static void render_text(const char *text, float x, float y, SDL_Color color);
+static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
 
 int main(int argc, char *argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK) < 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
     }
 
-    if (TTF_Init() < 0) {
+    if (!TTF_Init()) {
         SDL_Log("TTF_Init failed: %s", SDL_GetError());
         return 1;
     }
 
-    if (SDL_CreateWindowAndRenderer("Joystick Menu", 640, 480, 0, &window, &renderer) < 0) {
+    if (!SDL_CreateWindowAndRenderer("Joystick Menu", 640, 480, 0, &window, &renderer)) {
         SDL_Log("Window/Renderer creation failed: %s", SDL_GetError());
         SDL_Quit();
         return 1;
@@ -93,6 +98,32 @@ int main(int argc, char *argv[]) {
         SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
         SDL_SetTextureAlphaMod(background_texture, 80);
     }
+
+    if (!Mix_Init(MIX_INIT_OGG)) {
+        SDL_Log("Mix_Init failed: %s", SDL_GetError());
+    }
+
+   SDL_AudioSpec desired_spec;
+    SDL_zero(desired_spec);
+
+    desired_spec.freq = 44100;
+    desired_spec.format = SDL_AUDIO_F32;  // Use SDL3 constant
+    desired_spec.channels = 2;
+
+    if (!Mix_OpenAudio(0, &desired_spec)) {
+        SDL_Log("Mix_OpenAudio success");
+    } else {
+        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
+    }
+
+    music = Mix_LoadMUS("assets/background1.ogg");
+    if (!music) {
+        SDL_Log("Failed to load music: %s", SDL_GetError());
+    } else {
+        Mix_VolumeMusic(64);
+        Mix_PlayMusic(music, -1);
+    }
+
 
     SDL_Event event;
     int running = 1;
@@ -133,6 +164,11 @@ int main(int argc, char *argv[]) {
         else
             draw_system_menu();
 
+        // Draw signature bottom-left
+        SDL_Color sig_color = { 150, 150, 150, 255 };
+        const char *signature = "by MARCO AURELIO SIMAO"; // Change this text to your real signature
+        render_text(signature, 10, win_h - FONT_SIZE - 10, sig_color);
+
         SDL_RenderPresent(renderer);
         SDL_Delay(16);
     }
@@ -141,6 +177,9 @@ int main(int argc, char *argv[]) {
     TTF_CloseFont(font);
     SDL_DestroyTexture(logo_texture);
     SDL_DestroyTexture(background_texture);
+    Mix_FreeMusic(music);
+    Mix_CloseAudio();
+    Mix_Quit();
     TTF_Quit();
     SDL_Quit();
     return 0;
@@ -161,6 +200,39 @@ static void render_text_centered(const char *text, float y, SDL_Color color) {
     SDL_FRect dst = { (win_w - text_w) / 2.0f, y, (float)text_w, (float)text_h };
     SDL_RenderTexture(renderer, texture, NULL, &dst);
     SDL_DestroyTexture(texture);
+}
+
+static void render_text(const char *text, float x, float y, SDL_Color color) {
+    SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
+    if (!surface) return;
+
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+    int text_w = surface->w;
+    int text_h = surface->h;
+    SDL_DestroySurface(surface);
+
+    SDL_FRect dst = { x, y, (float)text_w, (float)text_h };
+    SDL_RenderTexture(renderer, texture, NULL, &dst);
+    SDL_DestroyTexture(texture);
+}
+
+static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w) {
+    if (item_count <= visible_lines) return;
+
+    float scrollbar_height = visible_lines * line_height;
+    float handle_height = scrollbar_height * (visible_lines / (float)item_count);
+    float handle_y = start_y + (scroll_offset / (float)item_count) * scrollbar_height;
+
+    SDL_FRect bar = { win_w - 20.0f, (float)start_y, 8.0f, scrollbar_height };
+    SDL_FRect handle = { win_w - 20.0f, handle_y, 8.0f, handle_height };
+
+    // Draw background bar
+    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 200);
+    SDL_RenderFillRect(renderer, &bar);
+
+    // Draw handle
+    SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
+    SDL_RenderFillRect(renderer, &handle);
 }
 
 static void draw_system_menu(void) {
@@ -189,6 +261,8 @@ static void draw_system_menu(void) {
         const char *label = (i < item_count - 1) ? systems[i].display_name : "Exit";
         render_text_centered(label, start_y + (i - system_scroll_offset) * line_height, color);
     }
+
+    draw_scrollbar(item_count, visible_lines, system_scroll_offset, start_y, line_height, win_w);
 }
 
 static void draw_rom_menu(void) {
@@ -215,6 +289,8 @@ static void draw_rom_menu(void) {
 
         render_text_centered(rom_list[i].display_name, start_y + (i - rom_scroll_offset) * line_height, color);
     }
+
+    draw_scrollbar(rom_count, visible_lines, rom_scroll_offset, start_y, line_height, win_w);
 }
 
 static void handle_joystick_input(const SDL_Event *event) {
@@ -247,7 +323,11 @@ static void handle_joystick_input(const SDL_Event *event) {
                 char cmd[1024];
                 SDL_snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"",
                     sys->mame_sys, sys->launch_arg, rom_list[selected_rom_index].rom_path);
+                
+                Mix_PauseMusic();   // Pause music before launching the ROM
                 system(cmd);
+                Mix_ResumeMusic();  // Resume music after exiting the ROM
+                
                 in_rom_menu = 0;
                 free_rom_list();
             }
