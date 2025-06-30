@@ -8,7 +8,8 @@ SDL3_ttf (earlier version used SDL_RenderDebugText)
 export DYLD_FRAMEWORK_PATH=./ (here goes path of LD Library on Linux and DYlD Library paths - adjust it's inconsistent)
 ./joystick_menu
 
-clang list_joysticks.c -o list_joysticks -F/Library/Frameworks -framework SDL3 (macOS last to work)
+clang list_joysticks.c -o list_joysticks -F/Library/Frameworks -framework SDL3
+clang joystick_menu.c -o joystick_menu -I/opt/homebrew/include -L/opt/homebrew/lib -lSDL3 -lSDL3_image -lSDL3_ttf (macOS last to work)
 
 gcc joystick_menu.c -o joystick_menu -I/usr/local/include -L/usr/local/lib -lSDL3 -lSDL3_image
 
