@@ -1,1 +1,7 @@
+The first entry always will be the last working
+
+v0.02
+gcc joystick_menu.c -o joystick_menu -I/usr/local/include -L/usr/local/lib -lSDL3 -lSDL3_image -lSDL3_mixer -lSDL3_ttf
+
+v0.01
 gcc joystick_menu.c -o joystick_menu -I/usr/local/include/SDL3 -L/usr/local/lib -lSDL3

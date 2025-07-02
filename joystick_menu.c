@@ -91,16 +91,20 @@ static SDL_Texture *load_cover_for_rom(const char *rom_path) {
 
     // Try .png first
     snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.png", base_len, filename);
+    
     if (file_exists(cover_path)) {
         tex = IMG_LoadTexture(renderer, cover_path);
         if (tex) return tex;
     }
+    
     // Try .jpg
     snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.jpg", base_len, filename);
+    
     if (file_exists(cover_path)) {
         tex = IMG_LoadTexture(renderer, cover_path);
         if (tex) return tex;
     }
+
     return NULL;
 }
 
@@ -124,6 +128,7 @@ int main(int argc, char *argv[]) {
     Mix_OpenAudio(0, &desired_spec);
 
     music = Mix_LoadMUS("assets/background1.ogg");
+    
     if (music) {
         Mix_VolumeMusic(64);
         Mix_PlayMusic(music, -1);
@@ -135,8 +140,17 @@ int main(int argc, char *argv[]) {
     while (running) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) running = 0;
-            if (event.type == SDL_EVENT_JOYSTICK_ADDED) SDL_OpenJoystick(event.jdevice.which);
-            if (event.type == SDL_EVENT_JOYSTICK_REMOVED) SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));
+            
+            if (event.type == SDL_EVENT_JOYSTICK_ADDED) {
+                SDL_Log("Joystick found.");
+                SDL_OpenJoystick(event.jdevice.which);
+            }
+            
+            if (event.type == SDL_EVENT_JOYSTICK_REMOVED) {
+                SDL_Log("Joystick removed.");
+                SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));
+            }
+            
             handle_joystick_input(&event);
         }
 
@@ -172,15 +186,18 @@ int main(int argc, char *argv[]) {
     TTF_CloseFont(font);
     SDL_DestroyTexture(logo_texture);
     SDL_DestroyTexture(background_texture);
+    
     if (cover_texture) {
         SDL_DestroyTexture(cover_texture);
         cover_texture = NULL;
     }
+
     Mix_FreeMusic(music);
     Mix_CloseAudio();
     Mix_Quit();
     TTF_Quit();
     SDL_Quit();
+
     return 0;
 }
 
@@ -207,6 +224,7 @@ static void render_text(const char *text, float x, float y, SDL_Color color) {
 
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w) {
     if (item_count <= visible_lines) return;
+
     float scrollbar_height = visible_lines * line_height;
     float handle_height = scrollbar_height * (visible_lines / (float)item_count);
     float handle_y = start_y + (scroll_offset / (float)item_count) * scrollbar_height;
@@ -223,17 +241,25 @@ static void draw_system_menu(void) {
     int item_count = sizeof(systems) / sizeof(SystemEntry) + 1;
     int line_height = FONT_SIZE + 10;
     int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
+    
     if (selected_system_index < system_scroll_offset) system_scroll_offset = selected_system_index;
+    
     if (selected_system_index >= system_scroll_offset + visible_lines) system_scroll_offset = selected_system_index - visible_lines + 1;
+    
     int start_y = LOGO_HEIGHT + 20;
+    
     for (int i = 0; i < item_count; ++i) {
         if (i < system_scroll_offset) continue;
         if (i >= system_scroll_offset + visible_lines) break;
+        
         SDL_Color color = { 200, 200, 200, 255 };
+        
         if (i == selected_system_index) color.r = color.g = 255;
+        
         const char *label = (i < item_count - 1) ? systems[i].display_name : "Exit";
         render_text_centered(label, start_y + (i - system_scroll_offset) * line_height, color);
     }
+
     draw_scrollbar(item_count, visible_lines, system_scroll_offset, start_y, line_height, win_w);
 }
 
@@ -241,16 +267,24 @@ static void draw_rom_menu(void) {
     int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h);
     int line_height = FONT_SIZE + 10;
     int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
+    
     if (selected_rom_index < rom_scroll_offset) rom_scroll_offset = selected_rom_index;
+    
     if (selected_rom_index >= rom_scroll_offset + visible_lines) rom_scroll_offset = selected_rom_index - visible_lines + 1;
+    
     int start_y = LOGO_HEIGHT + 20;
+    
     for (int i = 0; i < rom_count; ++i) {
         if (i < rom_scroll_offset) continue;
         if (i >= rom_scroll_offset + visible_lines) break;
+        
         SDL_Color color = { 200, 200, 200, 255 };
+        
         if (i == selected_rom_index) color.r = color.g = 255;
+        
         render_text_centered(rom_list[i].display_name, start_y + (i - rom_scroll_offset) * line_height, color);
     }
+
     draw_scrollbar(rom_count, visible_lines, rom_scroll_offset, start_y, line_height, win_w);
 
     if (rom_list[selected_rom_index].rom_path) {
@@ -258,12 +292,15 @@ static void draw_rom_menu(void) {
             SDL_DestroyTexture(cover_texture);
             cover_texture = NULL;
         }
+
         cover_texture = load_cover_for_rom(rom_list[selected_rom_index].rom_path);
+        
         if (!cover_texture) {
             cover_texture = IMG_LoadTexture(renderer, "assets/cover.png");
-        }
+        } 
+        
         if (cover_texture) {
-            SDL_FRect dst = { win_w - 150.0f, 0.0f, 140.0f, 140.0f };
+            SDL_FRect dst = { win_w - 10 - 150.0f, 10 + 0.0f, 140.0f, 140.0f };
             SDL_RenderTexture(renderer, cover_texture, NULL, &dst);
         }
     }
@@ -275,8 +312,10 @@ static void handle_joystick_input(const SDL_Event *event) {
 
     if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
         int direction = 0;
+        
         if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
         else if (event->jaxis.value > AXIS_DEADZONE) direction = 1;
+        
         if (direction) {
             if (in_rom_menu)
                 selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
@@ -311,20 +350,25 @@ static void handle_joystick_input(const SDL_Event *event) {
             selected_rom_index = 0;
             rom_scroll_offset = 0;
         }
+
         last_input_time = now;
     }
 }
 
 static int has_allowed_extension(const char *filename, const char *allowed_exts) {
     const char *dot = strrchr(filename, '.');
+    
     if (!dot || dot == filename) return 0;
+    
     char ext[16]; SDL_strlcpy(ext, dot + 1, sizeof(ext));
     char temp[64]; SDL_strlcpy(temp, allowed_exts, sizeof(temp));
     char *token = strtok(temp, ",");
+    
     while (token) {
         if (SDL_strcasecmp(ext, token) == 0) return 1;
         token = strtok(NULL, ",");
     }
+
     return 0;
 }
 
@@ -338,6 +382,7 @@ static void load_rom_list(const SystemEntry *sys) {
     rom_list = SDL_calloc(capacity, sizeof(RomEntry));
     rom_count = 0;
     struct dirent *entry;
+    
     while ((entry = readdir(dir))) {
         if (entry->d_type != DT_REG) continue;
         if (!has_allowed_extension(entry->d_name, sys->allowed_exts)) continue;
@@ -350,6 +395,7 @@ static void load_rom_list(const SystemEntry *sys) {
         rom_list[rom_count].rom_path = SDL_strdup(path);
         rom_count++;
     }
+
     closedir(dir);
     rom_list = SDL_realloc(rom_list, (rom_count + 1) * sizeof(RomEntry));
     rom_list[rom_count].display_name = SDL_strdup("Exit");
