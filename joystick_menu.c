@@ -35,12 +35,13 @@ typedef struct {
 } SystemEntry;
 
 static const SystemEntry systems[] = {
-    { "sms1", "Master System", "sms1", "-cart", "sms,bin" },
-    { "genesis", "Mega Drive", "genesis", "-cart", "md,bin" },
-    { "snes", "Super Nintendo", "snes", "-cart", "smc,sfc" },
-    { "nes", "Nintendo 8-bit", "nes", "-cart", "nes" },
+    { "sms1", "Master System", "sms1", "-cart", "sms,bin,zip" },
+    { "genesis", "Mega Drive", "genesis", "-cart", "md,bin,zip" },
+    { "snes", "Super Nintendo", "snes", "-cart", "smc,sfc,zip" },
+    { "nes", "Nintendo 8-bit", "nes", "-cart", "nes,zip" },
     { "segacd", "Mega CD", "segacd", "-cdrom", "cue,chd,iso" },
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
+    { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
 };
 
 static int selected_system_index = 0;
@@ -159,6 +160,7 @@ int main(int argc, char *argv[]) {
         SDL_SetTextureAlphaMod(background_texture, 80);
     }
 
+    /*
     Mix_Init(MIX_INIT_OGG);
     SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
     Mix_OpenAudio(0, &desired_spec);
@@ -169,6 +171,7 @@ int main(int argc, char *argv[]) {
         Mix_VolumeMusic(64);
         Mix_PlayMusic(music, -1);
     }
+    */
 
     SDL_Event event;
     int running = 1;
@@ -302,6 +305,7 @@ static void load_rom_list(const SystemEntry *sys) {
     rom_count = 0;
     struct dirent *entry;
 
+
     // 1) Load all files in the main system folder with allowed extensions
     while ((entry = readdir(dir))) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
@@ -386,16 +390,21 @@ static void handle_joystick_input(const SDL_Event *event) {
 
     if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
         int direction = 0;
-        if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
-        else if (event->jaxis.value > AXIS_DEADZONE) direction = 1;
+        
+        if (event->jaxis.value < -AXIS_DEADZONE) { 
+            direction = -1;
+        } else if (event->jaxis.value > AXIS_DEADZONE) {
+            direction = 1;
+        }
 
         if (direction) {
-            if (in_rom_menu)
+            if (in_rom_menu) {
                 selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
-            else {
+            } else {
                 int item_count = system_menu_count;
                 selected_system_index = (selected_system_index + item_count + direction) % item_count;
             }
+
             last_input_time = now;
         }
     }
@@ -433,20 +442,40 @@ static void handle_joystick_input(const SDL_Event *event) {
 
             if (final_rom_path[0] != '\0') {
                 char cmd[1024];
-                snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
-                Mix_PauseMusic();
-                system(cmd);
-                Mix_ResumeMusic();
+                //Mix_PauseMusic();
+
+                // NeoGeo is a special case in the sense of running it's games, so I made e if to handle it
+                // we create a empty file named game.neo and put it at bios folder (I don't know why but mame works like this, maybe there's a better way)
+                if (strcmp(sys->mame_sys, "neogeo") == 0) {
+                    char romstrsize[256];
+                    char *last_slash = strrchr(final_rom_path, '/');
+                    char *romdot = strrchr(final_rom_path, '.');
+
+                    strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
+                    romstrsize[(romdot - (last_slash + 1))] = '\0';
+
+                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
+                    
+                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
+                    system(cmd);
+                } else {
+                    snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
+                    system(cmd);
+                }
+
+                //Mix_ResumeMusic();
             }
 
             in_rom_menu = 0;
             free_rom_list();
         } else {
             int item_count = system_menu_count;
+
             if (selected_system_index == item_count - 1) {
                 exit(0);
             } else if (selected_system_index == item_count - 2) {
                 pid_t pid = fork();
+
                 if (pid == 0) {
                     execl("./cover-scraper", "./cover-scraper", (char *)NULL);
                     perror("Failed to exec cover-scraper");
@@ -464,6 +493,7 @@ static void handle_joystick_input(const SDL_Event *event) {
                 rom_scroll_offset = 0;
             }
         }
+        
         last_input_time = now;
     }
 }
@@ -492,6 +522,7 @@ static SDL_Texture *load_cover_for_rom(const char *rom_path) {
     }
 
     snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.jpg", base_len, filename);
+    
     if (file_exists(cover_path)) {
         tex = IMG_LoadTexture(renderer, cover_path);
         if (tex) return tex;
