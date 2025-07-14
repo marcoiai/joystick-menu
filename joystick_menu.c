@@ -131,8 +131,8 @@ static void draw_rom_menu(void) {
     int line_height = FONT_SIZE + 10;
     int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
 
-    SDL_Log("draw_rom_menu called. rom_list: %p, rom_count: %d, selected_rom_index: %d, rom_scroll_offset: %d",
-            (void*)rom_list, rom_count, selected_rom_index, rom_scroll_offset);
+    //SDL_Log("draw_rom_menu called. rom_list: %p, rom_count: %d, selected_rom_index: %d, rom_scroll_offset: %d",
+    //        (void*)rom_list, rom_count, selected_rom_index, rom_scroll_offset);
 
     // Adjust scroll offset to keep selected item visible
     if (selected_rom_index < rom_scroll_offset) {
@@ -153,7 +153,8 @@ static void draw_rom_menu(void) {
             SDL_Color color = { 200, 200, 200, 255 };
             if (i == selected_rom_index) color.r = color.g = 255;
 
-            SDL_Log("  Rendering ROM item %d: display_name_ptr=%p", i, (void*)rom_list[i].display_name);
+            //SDL_Log("  Rendering ROM item %d: display_name_ptr=%p", i, (void*)rom_list[i].display_name);
+
             if (rom_list[i].display_name) {
                 render_text_centered(rom_list[i].display_name, start_y + (i - rom_scroll_offset) * line_height, color);
             } else {
@@ -161,8 +162,10 @@ static void draw_rom_menu(void) {
                 render_text_centered("[NULL NAME]", start_y + (i - rom_scroll_offset) * line_height, (SDL_Color){255, 165, 0, 255});
             }
         }
+
         draw_scrollbar(rom_count, visible_lines, rom_scroll_offset, start_y, line_height, win_w);
     }
+
     draw_interactive_input_field(); // Draw input field regardless of ROMs found
 }
 
@@ -180,11 +183,13 @@ static void draw_interactive_input_field(void) {
     SDL_RenderFillRect(renderer, &input_bg_rect);
 
     SDL_Color border_color = {100, 100, 100, 255};
+
     if (typing_in_input) {
         border_color.r = 255;
         border_color.g = 255;
         border_color.b = 0;
     }
+
     SDL_SetRenderDrawColor(renderer, border_color.r, border_color.g, border_color.b, border_color.a);
     SDL_RenderRect(renderer, &input_bg_rect);
 
@@ -241,7 +246,7 @@ int main(int argc, char *argv[]) {
         }
 
         int win_w, win_h;
-        SDL_GetWindowSize(window, &win_h, &win_h); // Fix: Second argument should be win_h
+        SDL_GetWindowSize(window, &win_w, &win_h); // Fix: Second argument should be win_h
 
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
@@ -283,8 +288,6 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-// ... (rest of your code) ...
-
 static void render_text_centered(const char *text, float y, SDL_Color color) {
     // Defensive check for font being NULL
     if (!font) {
@@ -293,16 +296,20 @@ static void render_text_centered(const char *text, float y, SDL_Color color) {
     }
     // FIX 1: Use TTF_RenderText_Blended and provide string length
     SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
+
     if (!surface) {
-        SDL_Log("TTF_RenderText_Blended error: %s", SDL_GetError());
+        SDL_Log("TTF_RenderText_Blended error (render_text_centered line 301): %s", SDL_GetError());
         return;
     }
+
     SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+
     if (!texture) {
         SDL_Log("SDL_CreateTextureFromSurface error: %s", SDL_GetError());
         SDL_DestroySurface(surface);
         return;
     }
+
     int text_w = surface->w, text_h = surface->h;
     SDL_DestroySurface(surface);
     int win_w;
@@ -318,18 +325,23 @@ static void render_text(const char *text, float x, float y, SDL_Color color) {
         SDL_Log("Error: Font is NULL in render_text!");
         return;
     }
+
     // FIX 2: Use TTF_RenderText_Blended and provide string length
     SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
+
     if (!surface) {
-        SDL_Log("TTF_RenderText_Blended error: %s", SDL_GetError());
+        //SDL_Log("TTF_RenderText_Blended error (render_text line 333): %s", SDL_GetError());
         return;
     }
+
     SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+
     if (!texture) {
         SDL_Log("SDL_CreateTextureFromSurface error: %s", SDL_GetError());
         SDL_DestroySurface(surface);
         return;
     }
+
     int text_w = surface->w, text_h = surface->h;
     SDL_DestroySurface(surface);
     SDL_FRect dst = { x, y, (float)text_w, (float)text_h };
@@ -381,12 +393,13 @@ static int has_allowed_extension(const char *filename, const char *allowed_exts)
 }
 
 static void load_all_rom_list(const SystemEntry *sys) {
-    SDL_Log("load_all_rom_list called for system: %s", sys->display_name);
+    //SDL_Log("load_all_rom_list called for system: %s", sys->display_name);
     free_all_rom_list(); // Always free existing master list first
 
     char path[512];
     snprintf(path, sizeof(path), "./roms/%s/", sys->dir_name);
     DIR *dir = opendir(path);
+
     if (!dir) {
         SDL_Log("Could not open ROM directory: %s", path);
         return;
@@ -394,6 +407,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
 
     int capacity = 20;
     all_rom_list = calloc(capacity, sizeof(RomEntry));
+
     if (all_rom_list == NULL) {
         closedir(dir);
         SDL_Log("Failed to allocate memory for all_rom_list (initial)");
@@ -416,6 +430,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
             if (all_rom_count >= capacity) {
                 capacity *= 2;
                 RomEntry *new_all_rom_list = realloc(all_rom_list, capacity * sizeof(RomEntry));
+
                 if (new_all_rom_list == NULL) {
                     SDL_Log("Failed to reallocate memory for all_rom_list (main files)");
                     free_all_rom_list();
@@ -424,8 +439,10 @@ static void load_all_rom_list(const SystemEntry *sys) {
                 }
                 all_rom_list = new_all_rom_list;
             }
+
             all_rom_list[all_rom_count].display_name = strdup(entry->d_name);
             all_rom_list[all_rom_count].rom_path = strdup(full_path);
+
             if (!all_rom_list[all_rom_count].display_name || !all_rom_list[all_rom_count].rom_path) {
                 SDL_Log("Failed to strdup string for ROM entry: %s", entry->d_name);
                 free_all_rom_list();
@@ -450,6 +467,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
 
         if (S_ISDIR(st.st_mode)) {
             DIR *subdir = opendir(sub_path);
+
             if (!subdir) {
                 SDL_Log("Could not open subdirectory: %s", sub_path);
                 continue;
@@ -461,6 +479,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
                     if (all_rom_count >= capacity) {
                         capacity *= 2;
                         RomEntry *new_all_rom_list = realloc(all_rom_list, capacity * sizeof(RomEntry));
+
                         if (new_all_rom_list == NULL) {
                             SDL_Log("Failed to reallocate memory for all_rom_list (sub files)");
                             free_all_rom_list();
@@ -474,6 +493,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
                     char full_file_path[1024];
                     snprintf(full_file_path, sizeof(full_file_path), "./roms/%s/%s/%s", sys->dir_name, entry->d_name, sub_entry->d_name);
                     all_rom_list[all_rom_count].rom_path = strdup(full_file_path);
+
                     if (!all_rom_list[all_rom_count].display_name || !all_rom_list[all_rom_count].rom_path) {
                         SDL_Log("Failed to strdup string for sub-ROM entry: %s", sub_entry->d_name);
                         free_all_rom_list();
@@ -491,11 +511,12 @@ static void load_all_rom_list(const SystemEntry *sys) {
     closedir(dir);
 
     // No "Exit" option added to all_rom_list, it's added to the filtered rom_list
-    SDL_Log("Finished loading ALL ROM list. all_rom_list: %p, all_rom_count: %d", (void*)all_rom_list, all_rom_count);
+    //SDL_Log("Finished loading ALL ROM list. all_rom_list: %p, all_rom_count: %d", (void*)all_rom_list, all_rom_count);
 }
 
 static void free_all_rom_list(void) {
-    SDL_Log("free_all_rom_list called. all_rom_list: %p, all_rom_count: %d", (void*)all_rom_list, all_rom_count);
+    //SDL_Log("free_all_rom_list called. all_rom_list: %p, all_rom_count: %d", (void*)all_rom_list, all_rom_count);
+
     if (all_rom_list) {
         for (int i = 0; i < all_rom_count; ++i) {
             if (all_rom_list[i].display_name) {
@@ -516,12 +537,14 @@ static void free_all_rom_list(void) {
 // Existing free_rom_list, now frees the *filtered* list
 static void free_rom_list(void) {
     SDL_Log("free_rom_list called (filtered). rom_list: %p, rom_count: %d", (void*)rom_list, rom_count);
+
     if (rom_list) {
         // Only free the memory for the RomEntry array itself, not the strings,
         // as they are merely pointers to strings owned by all_rom_list.
         SDL_free(rom_list);
         rom_list = NULL;
     }
+
     rom_count = 0;
 }
 
@@ -534,15 +557,19 @@ static void filter_rom_list(const char *filter_text) {
         // If filter is empty, display all ROMs + "Exit"
         rom_count = all_rom_count + 1;
         rom_list = calloc(rom_count, sizeof(RomEntry));
+
         if (!rom_list) {
             SDL_Log("Failed to allocate memory for filtered rom_list (empty filter)");
             return;
         }
+
         for (int i = 0; i < all_rom_count; ++i) {
             rom_list[i] = all_rom_list[i]; // Copy pointers
         }
+
         rom_list[all_rom_count].display_name = strdup("Exit");
         rom_list[all_rom_count].rom_path = NULL;
+
         if (!rom_list[all_rom_count].display_name) {
             SDL_Log("Failed to strdup 'Exit' for filtered list (empty filter)");
             free_rom_list(); // Free partial allocation
@@ -552,6 +579,7 @@ static void filter_rom_list(const char *filter_text) {
         // Filter based on input_text
         int temp_rom_count = 0;
         RomEntry *temp_rom_list = calloc(all_rom_count + 1, sizeof(RomEntry)); // Max possible + Exit
+
         if (!temp_rom_list) {
             SDL_Log("Failed to allocate temporary memory for filtered rom_list");
             return;
@@ -567,6 +595,7 @@ static void filter_rom_list(const char *filter_text) {
         if (temp_rom_count < (all_rom_count + 1)) { // Ensure space for "Exit"
             temp_rom_list[temp_rom_count].display_name = strdup("Exit");
             temp_rom_list[temp_rom_count].rom_path = NULL;
+
             if (!temp_rom_list[temp_rom_count].display_name) {
                 SDL_Log("Failed to strdup 'Exit' for filtered list");
                 // Need to free temp_rom_list and its strdup'd "Exit" if it was allocated
@@ -576,10 +605,12 @@ static void filter_rom_list(const char *filter_text) {
                 SDL_free(temp_rom_list);
                 return;
             }
+
             temp_rom_count++;
         }
 
         rom_list = realloc(temp_rom_list, temp_rom_count * sizeof(RomEntry));
+
         if (!rom_list && temp_rom_count > 0) { // realloc can return NULL if size is 0, but if temp_rom_count > 0, it's an error
             SDL_Log("Failed to reallocate filtered rom_list to final size");
             // Original temp_rom_list is still valid, but we should free it and its strdup'd "Exit"
@@ -593,7 +624,7 @@ static void filter_rom_list(const char *filter_text) {
 
     selected_rom_index = 0;
     rom_scroll_offset = 0;
-    SDL_Log("Finished filtering ROM list. Displaying %d ROMs.", rom_count);
+    //SDL_Log("Finished filtering ROM list. Displaying %d ROMs.", rom_count);
 }
 
 
@@ -657,6 +688,7 @@ static void handle_joystick_input(const SDL_Event *event) {
             const SystemEntry *sys = &systems[selected_system_index];
             const char *rom_path = rom_list[selected_rom_index].rom_path;
             struct stat st;
+
             if (stat(rom_path, &st) == -1) {
                 SDL_Log("Failed to stat ROM path: %s", rom_path);
                 return;
@@ -666,6 +698,7 @@ static void handle_joystick_input(const SDL_Event *event) {
 
             if (S_ISDIR(st.st_mode)) {
                 DIR *d = opendir(rom_path);
+
                 if (!d) {
                     SDL_Log("Failed to open ROM directory for launch: %s", rom_path);
                     return;
@@ -687,6 +720,7 @@ static void handle_joystick_input(const SDL_Event *event) {
                 snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                 Mix_PauseMusic();
                 int ret = system(cmd);
+
                 if (ret != 0) {
                     SDL_Log("MAME command failed with exit code %d: %s", ret, cmd);
                 }
@@ -701,10 +735,12 @@ static void handle_joystick_input(const SDL_Event *event) {
             input_text[0] = '\0'; // Clear input
         } else {
             int item_count = system_menu_count;
+
             if (selected_system_index == item_count - 1) {
                 exit(0);
             } else if (selected_system_index == item_count - 2) {
                 pid_t pid = fork();
+
                 if (pid == 0) {
                     execl("./cover-scraper", "./cover-scraper", (char *)NULL);
                     perror("Failed to exec cover-scraper");
@@ -745,6 +781,7 @@ static void handle_keyboard_input(const SDL_Event *event) {
                 typing_in_input = 0;
                 SDL_StopTextInput(window);
                 SDL_Log("Input field content: %s", input_text);
+
                 filter_rom_list(input_text); // Apply filter when done typing
                 last_input_time = now;
             } else if (event->key.scancode == SDL_SCANCODE_BACKSPACE && strlen(input_text) > 0) {
@@ -839,13 +876,16 @@ static void handle_keyboard_input(const SDL_Event *event) {
                         snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                         Mix_PauseMusic();
                         int ret = system(cmd);
+
                         if (ret != 0) {
                             SDL_Log("MAME command failed with exit code %d: %s", ret, cmd);
                         }
+
                         Mix_ResumeMusic();
                     } else {
                         SDL_Log("No valid ROM file found in directory %s for launch.", rom_path);
                     }
+
                     in_rom_menu = 0;
                     free_rom_list(); // Free filtered list
                     free_all_rom_list(); // Free master list
@@ -856,6 +896,7 @@ static void handle_keyboard_input(const SDL_Event *event) {
                         exit(0);
                     } else if (selected_system_index == item_count - 2) {
                         pid_t pid = fork();
+
                         if (pid == 0) {
                             execl("./cover-scraper", "./cover-scraper", (char *)NULL);
                             perror("Failed to exec cover-scraper");
