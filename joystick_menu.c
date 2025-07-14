@@ -45,10 +45,10 @@ typedef struct {
 } SystemEntry;
 
 static const SystemEntry systems[] = {
-    { "sms1", "Master System", "sms1", "-cart", "sms,bin" },
-    { "genesis", "Mega Drive", "genesis", "-cart", "md,bin" },
-    { "snes", "Super Nintendo", "snes", "-cart", "smc,sfc" },
-    { "nes", "Nintendo 8-bit", "nes", "-cart", "nes" },
+    { "sms1", "Master System", "sms1", "-cart", "sms,bin,zip" },
+    { "genesis", "Mega Drive", "genesis", "-cart", "md,bin,zip" },
+    { "snes", "Super Nintendo", "snes", "-cart", "smc,sfc,zip" },
+    { "nes", "Nintendo 8-bit", "nes", "-cart", "nes,zip" },
     { "segacd", "Mega CD", "segacd", "-cdrom", "cue,chd,iso" },
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
 };
