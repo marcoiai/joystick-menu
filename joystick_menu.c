@@ -64,6 +64,7 @@ static void draw_system_menu(void);
 static void draw_rom_menu(void);
 static void load_rom_list(const SystemEntry *sys);
 static void free_rom_list(void);
+static void handle_events(const SDL_Event *event);
 static void handle_joystick_input(const SDL_Event *event);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
 static void render_text_centered(const char *text, float y, SDL_Color color);
@@ -190,6 +191,7 @@ int main(int argc, char *argv[]) {
                 SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));
             }
 
+            handle_events(&event);
             handle_joystick_input(&event);
         }
 
@@ -381,6 +383,26 @@ static void free_rom_list(void) {
     if (cover_texture) {
         SDL_DestroyTexture(cover_texture);
         cover_texture = NULL;
+    }
+}
+
+static void handle_events(const SDL_Event *event)
+{
+    switch (event->type)
+    {
+    // ... other event types like JOYSTICK_ADDED, JOYSTICK_AXIS_MOTION, etc.
+
+    case SDL_EVENT_KEY_DOWN: // This case ensures event->key is valid
+        if (event->key.keycode == SDLK_ESCAPE) {
+            //quit = true;
+            printf("Escape key pressed! Quitting application.\n");
+        }
+        // ... other keyboard key checks (like SDLK_UP, SDLK_DOWN, SDLK_RETURN)
+        break;
+
+    // ... other event types
+    default:
+        break;
     }
 }
 
