@@ -11,17 +11,11 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/*
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_main.h>
-#include <SDL3_image/SDL_image.h>
-#include <SDL3_ttf/SDL_ttf.h>
-#include <SDL3_mixer/SDL_mixer.h>
-*/
 static Mix_Music *music = NULL;
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
 static SDL_Texture *logo_texture = NULL;
+static SDL_Texture *cover_texture = NULL;
 static SDL_Texture *background_texture = NULL;
 static TTF_Font *font = NULL;
 
@@ -86,6 +80,7 @@ static void render_text(const char *text, float x, float y, SDL_Color color);
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
 static int file_exists(const char *path);
 static void draw_interactive_input_field(void);
+static SDL_Texture *load_cover_for_rom(const char *rom_path);
 
 static void handle_joystick_input(const SDL_Event *event);
 static void handle_keyboard_input(const SDL_Event *event);
@@ -165,6 +160,23 @@ static void draw_rom_menu(void) {
         }
 
         draw_scrollbar(rom_count, visible_lines, rom_scroll_offset, start_y, line_height, win_w);
+
+        if (rom_list && rom_list[selected_rom_index].rom_path) {
+            if (cover_texture) {
+                SDL_DestroyTexture(cover_texture);
+                cover_texture = NULL;
+            }
+
+            cover_texture = load_cover_for_rom(rom_list[selected_rom_index].rom_path);
+            if (!cover_texture) {
+                cover_texture = IMG_LoadTexture(renderer, "assets/cover.png");
+            }
+
+            if (cover_texture) {
+                SDL_FRect dst = { win_w - 80 - 150.0f, 30 + 0.0f, 220.0f, 220.0f };
+                SDL_RenderTexture(renderer, cover_texture, NULL, &dst);
+            }
+        }
     }
 
     draw_interactive_input_field(); // Draw input field regardless of ROMs found
@@ -279,6 +291,7 @@ int main(int argc, char *argv[]) {
     TTF_CloseFont(font);
     SDL_DestroyTexture(logo_texture);
     SDL_DestroyTexture(background_texture);
+    SDL_DestroyTexture(cover_texture);
 
     Mix_FreeMusic(music);
     Mix_CloseAudio();
@@ -958,4 +971,32 @@ static void handle_keyboard_input(const SDL_Event *event) {
             filter_rom_list(input_text); // Apply filter on each text input
         }
     }
+}
+
+static SDL_Texture *load_cover_for_rom(const char *rom_path) {
+    if (!rom_path) return NULL;
+
+    const char *filename = strrchr(rom_path, '/');
+    filename = filename ? filename + 1 : rom_path;
+
+    const char *dot = strrchr(filename, '.');
+    int base_len = dot ? (int)(dot - filename) : (int)strlen(filename);
+
+    char cover_path[512];
+    SDL_Texture *tex = NULL;
+
+    snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.png", base_len, filename);
+    if (file_exists(cover_path)) {
+        tex = IMG_LoadTexture(renderer, cover_path);
+        if (tex) return tex;
+    }
+
+    snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.jpg", base_len, filename);
+    
+    if (file_exists(cover_path)) {
+        tex = IMG_LoadTexture(renderer, cover_path);
+        if (tex) return tex;
+    }
+
+    return NULL;
 }
