@@ -51,6 +51,7 @@ static const SystemEntry systems[] = {
     { "nes", "Nintendo 8-bit", "nes", "-cart", "nes,zip" },
     { "segacd", "Mega CD", "segacd", "-cdrom", "cue,chd,iso" },
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
+    { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
 };
 
 static int selected_system_index = 0;
@@ -717,13 +718,27 @@ static void handle_joystick_input(const SDL_Event *event) {
 
             if (final_rom_path[0] != '\0') {
                 char cmd[1024];
-                snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                 Mix_PauseMusic();
-                int ret = system(cmd);
 
-                if (ret != 0) {
-                    SDL_Log("MAME command failed with exit code %d: %s", ret, cmd);
+                // NeoGeo is a special case in the sense of running it's games, so I made e if to handle it
+                // we create a empty file named game.neo and put it at bios folder (I don't know why but mame works like this, maybe there's a better way)
+                if (strcmp(sys->mame_sys, "neogeo") == 0) {
+                    char romstrsize[256];
+                    char *last_slash = strrchr(final_rom_path, '/');
+                    char *romdot = strrchr(final_rom_path, '.');
+
+                    strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
+                    romstrsize[(romdot - (last_slash + 1))] = '\0';
+
+                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
+                    
+                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
+                    system(cmd);
+                } else {
+                    snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
+                    system(cmd);
                 }
+
                 Mix_ResumeMusic();
             } else {
                 SDL_Log("No valid ROM file found in directory %s for launch.", rom_path);
@@ -873,12 +888,25 @@ static void handle_keyboard_input(const SDL_Event *event) {
 
                     if (final_rom_path[0] != '\0') {
                         char cmd[1024];
-                        snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                         Mix_PauseMusic();
-                        int ret = system(cmd);
 
-                        if (ret != 0) {
-                            SDL_Log("MAME command failed with exit code %d: %s", ret, cmd);
+                        // NeoGeo is a special case in the sense of running it's games, so I made e if to handle it
+                        // we create a empty file named game.neo and put it at bios folder (I don't know why but mame works like this, maybe there's a better way)
+                        if (strcmp(sys->mame_sys, "neogeo") == 0) {
+                            char romstrsize[256];
+                            char *last_slash = strrchr(final_rom_path, '/');
+                            char *romdot = strrchr(final_rom_path, '.');
+
+                            strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
+                            romstrsize[(romdot - (last_slash + 1))] = '\0';
+
+                            SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
+                            
+                            snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
+                            system(cmd);
+                        } else {
+                            snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
+                            system(cmd);
                         }
 
                         Mix_ResumeMusic();
