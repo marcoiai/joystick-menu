@@ -46,6 +46,7 @@ static const SystemEntry systems[] = {
     { "segacd", "Mega CD", "segacd", "-cdrom", "cue,chd,iso" },
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
     { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
+    { "ps3", "PlayStation 3", "rpcs3", "-iso", "iso" },
 };
 
 static int selected_system_index = 0;
@@ -744,9 +745,14 @@ static void handle_joystick_input(const SDL_Event *event) {
                     romstrsize[(romdot - (last_slash + 1))] = '\0';
 
                     SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-                    
+
                     snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
                     system(cmd);
+                } else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
+                       // macOS RPCS3 launch
+                        snprintf(cmd, sizeof(cmd), "open -a /Users/auser/Applications/RPCS3/RPCS3.app/Contents/MacOS/launcher --args --game=\"%s\"", final_rom_path);
+                        system(cmd);
+
                 } else {
                     snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                     system(cmd);
@@ -914,9 +920,13 @@ static void handle_keyboard_input(const SDL_Event *event) {
                             romstrsize[(romdot - (last_slash + 1))] = '\0';
 
                             SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-                            
+
                             snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
                             system(cmd);
+                        }  else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
+                       // macOS RPCS3 launch
+                        snprintf(cmd, sizeof(cmd), "open -a /Users/auser/Applications/RPCS3/RPCS3.app/Contents/MacOS/launcher --args --game=\"%s\"", final_rom_path);
+                        system(cmd);
                         } else {
                             snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
                             system(cmd);
@@ -992,7 +1002,7 @@ static SDL_Texture *load_cover_for_rom(const char *rom_path) {
     }
 
     snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.jpg", base_len, filename);
-    
+
     if (file_exists(cover_path)) {
         tex = IMG_LoadTexture(renderer, cover_path);
         if (tex) return tex;
