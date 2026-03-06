@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <glob.h>
 
 static Mix_Music *music = NULL;
 static SDL_Window *window = NULL;
@@ -27,6 +28,7 @@ static TTF_Font *font = NULL;
 #define MAX_INPUT_LENGTH 256
 static char input_text[MAX_INPUT_LENGTH] = "";
 static int typing_in_input = 0;
+static int app_running = 1;
 
 static Uint64 last_input_time = 0;
 
@@ -45,6 +47,7 @@ static const SystemEntry systems[] = {
     { "nes", "Nintendo 8-bit", "nes", "-cart", "nes,zip" },
     { "segacd", "Mega CD", "segacd", "-cdrom", "cue,chd,iso" },
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
+    { "ps2", "PlayStation 2", "pcsx2", NULL, "iso,chd,cso" },
     { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
     { "ps3", "PlayStation 3", "rpcs3", "-iso", "iso" },
 };
@@ -58,6 +61,7 @@ static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 2;
 typedef struct {
     char *display_name;
     char *rom_path;
+    int owns_display_name;
 } RomEntry;
 
 static RomEntry *all_rom_list = NULL; // Stores all ROMs for the current system
@@ -82,6 +86,15 @@ static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset,
 static int file_exists(const char *path);
 static void draw_interactive_input_field(void);
 static SDL_Texture *load_cover_for_rom(const char *rom_path);
+static void leave_rom_menu(void);
+static int run_process(const char *const argv[]);
+static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size);
+static int extract_rom_id(const char *rom_path, char *rom_id, size_t rom_id_size);
+static const char *find_pcsx2_app_path(void);
+static const char *resolve_absolute_path(const char *path);
+static const char *find_pcsx2_binary_path(void);
+static void launch_selected_rom(void);
+static void handle_current_selection(void);
 
 static void handle_joystick_input(const SDL_Event *event);
 static void handle_keyboard_input(const SDL_Event *event);
@@ -213,12 +226,308 @@ static void draw_interactive_input_field(void) {
     render_text(display_text, input_x + 5, input_y + 5, text_color);
 }
 
-int main(int argc, char *argv[]) {
-    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_AUDIO);
-    TTF_Init();
+static void leave_rom_menu(void) {
+    in_rom_menu = 0;
+    typing_in_input = 0;
+    SDL_StopTextInput(window);
+    free_rom_list();
+    free_all_rom_list();
+    input_text[0] = '\0';
+}
 
-    SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer);
+static int run_process(const char *const argv[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(argv[0], (char *const *)argv);
+        perror("Failed to execute process");
+        _exit(127);
+    }
+    if (pid < 0) {
+        perror("Failed to fork");
+        return 0;
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid failed");
+        return 0;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        SDL_Log("Process returned non-zero status for command: %s", argv[0]);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size) {
+    struct stat st;
+    if (stat(rom_path, &st) == -1) {
+        SDL_Log("Failed to stat ROM path: %s", rom_path);
+        return 0;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+        snprintf(final_rom_path, final_size, "%s", rom_path);
+        return 1;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        SDL_Log("Unsupported ROM path type: %s", rom_path);
+        return 0;
+    }
+
+    DIR *d = opendir(rom_path);
+    if (!d) {
+        SDL_Log("Failed to open ROM directory for launch: %s", rom_path);
+        return 0;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+
+        char candidate_path[1024];
+        snprintf(candidate_path, sizeof(candidate_path), "%s/%s", rom_path, ent->d_name);
+
+        struct stat candidate_st;
+        if (stat(candidate_path, &candidate_st) == -1) {
+            continue;
+        }
+
+        if (S_ISREG(candidate_st.st_mode) && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
+            snprintf(final_rom_path, final_size, "%s", candidate_path);
+            closedir(d);
+            return 1;
+        }
+    }
+
+    closedir(d);
+    SDL_Log("No valid ROM file found in directory %s for launch.", rom_path);
+    return 0;
+}
+
+static int extract_rom_id(const char *rom_path, char *rom_id, size_t rom_id_size) {
+    const char *last_slash = strrchr(rom_path, '/');
+    const char *filename = last_slash ? last_slash + 1 : rom_path;
+    const char *romdot = strrchr(filename, '.');
+    size_t name_len = romdot ? (size_t)(romdot - filename) : strlen(filename);
+
+    if (name_len == 0 || name_len >= rom_id_size) {
+        return 0;
+    }
+
+    memcpy(rom_id, filename, name_len);
+    rom_id[name_len] = '\0';
+    return 1;
+}
+
+static const char *find_pcsx2_app_path(void) {
+    static char app_path[1024];
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+
+    if (glob("/Applications/PCSX2*.app", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+        SDL_strlcpy(app_path, g.gl_pathv[0], sizeof(app_path));
+        globfree(&g);
+        return app_path;
+    }
+
+    globfree(&g);
+    return NULL;
+}
+
+static const char *resolve_absolute_path(const char *path) {
+    static char abs_path[4096];
+    if (realpath(path, abs_path)) {
+        return abs_path;
+    }
+    return path;
+}
+
+static const char *find_pcsx2_binary_path(void) {
+    static char binary_path[4096];
+    const char *app_path = find_pcsx2_app_path();
+    if (!app_path) {
+        return NULL;
+    }
+
+    snprintf(binary_path, sizeof(binary_path), "%s/Contents/MacOS/PCSX2", app_path);
+    if (access(binary_path, X_OK) == 0) {
+        return binary_path;
+    }
+
+    char pattern[4096];
+    snprintf(pattern, sizeof(pattern), "%s/Contents/MacOS/*", app_path);
+
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    if (glob(pattern, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; ++i) {
+            if (access(g.gl_pathv[i], X_OK) == 0) {
+                SDL_strlcpy(binary_path, g.gl_pathv[i], sizeof(binary_path));
+                globfree(&g);
+                return binary_path;
+            }
+        }
+    }
+
+    globfree(&g);
+    return NULL;
+}
+
+static void launch_selected_rom(void) {
+    if (!rom_list || selected_rom_index < 0 || selected_rom_index >= rom_count) {
+        SDL_Log("Attempted to access invalid ROM index or rom_list is NULL. Index: %d, Count: %d", selected_rom_index, rom_count);
+        return;
+    }
+
+    if (rom_list[selected_rom_index].rom_path == NULL) {
+        leave_rom_menu();
+        return;
+    }
+
+    const SystemEntry *sys = &systems[selected_system_index];
+    const char *rom_path = rom_list[selected_rom_index].rom_path;
+    char final_rom_path[1024] = "";
+
+    if (!resolve_launch_rom_path(sys, rom_path, final_rom_path, sizeof(final_rom_path))) {
+        return;
+    }
+    const char *launch_rom_path = resolve_absolute_path(final_rom_path);
+
+    int previous_music_volume = Mix_VolumeMusic(-1);
+    int was_music_playing = Mix_PlayingMusic();
+    if (was_music_playing) {
+        Mix_VolumeMusic(0);
+    }
+
+    if (strcmp(sys->mame_sys, "neogeo") == 0) {
+        char rom_id[256];
+        if (!extract_rom_id(final_rom_path, rom_id, sizeof(rom_id))) {
+            SDL_Log("Failed to parse NeoGeo ROM id from path: %s", final_rom_path);
+        } else {
+            const char *const argv[] = { "mame", sys->mame_sys, rom_id, NULL };
+            SDL_Log("mame %s %s", sys->mame_sys, rom_id);
+            run_process(argv);
+        }
+    } else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
+        char game_arg[1200];
+        snprintf(game_arg, sizeof(game_arg), "--game=%s", launch_rom_path);
+        const char *const argv[] = {
+            "open",
+            "-W",
+            "-a",
+            "/Users/auser/Applications/RPCS3/RPCS3.app/Contents/MacOS/launcher",
+            "--args",
+            game_arg,
+            NULL
+        };
+        run_process(argv);
+    } else if (strcmp(sys->mame_sys, "pcsx2") == 0) {
+        const char *pcsx2_bin = find_pcsx2_binary_path();
+        if (pcsx2_bin) {
+            const char *const argv_nogui[] = {
+                pcsx2_bin,
+                "-nogui",
+                "-batch",
+                "-fastboot",
+                "-fullscreen",
+                "--",
+                launch_rom_path,
+                NULL
+            };
+            int launched = run_process(argv_nogui);
+            if (!launched) {
+                const char *const argv_gui[] = {
+                    pcsx2_bin,
+                    "-batch",
+                    "-fastboot",
+                    "-fullscreen",
+                    "--",
+                    launch_rom_path,
+                    NULL
+                };
+                run_process(argv_gui);
+            }
+        } else {
+            const char *const argv[] = {
+                "open",
+                "-W",
+                "-a",
+                "PCSX2",
+                "--args",
+                "-batch",
+                "-fastboot",
+                "-fullscreen",
+                "--",
+                launch_rom_path,
+                NULL
+            };
+            run_process(argv);
+        }
+    } else {
+        const char *const argv[] = { "mame", sys->mame_sys, sys->launch_arg, launch_rom_path, NULL };
+        run_process(argv);
+    }
+
+    if (was_music_playing) {
+        Mix_VolumeMusic(previous_music_volume >= 0 ? previous_music_volume : 64);
+    }
+    leave_rom_menu();
+}
+
+static void handle_current_selection(void) {
+    if (in_rom_menu) {
+        launch_selected_rom();
+        return;
+    }
+
+    int item_count = system_menu_count;
+    if (selected_system_index == item_count - 1) {
+        app_running = 0;
+        return;
+    }
+
+    if (selected_system_index == item_count - 2) {
+        const char *const argv[] = { "./cover-scraper", NULL };
+        run_process(argv);
+        return;
+    }
+
+    load_all_rom_list(&systems[selected_system_index]);
+    filter_rom_list(input_text);
+    in_rom_menu = 1;
+}
+
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_AUDIO)) {
+        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        return 1;
+    }
+
+    if (!TTF_Init()) {
+        SDL_Log("TTF_Init failed: %s", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    if (!SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer)) {
+        SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
+    }
     font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
+    if (!font) {
+        SDL_Log("TTF_OpenFont failed: %s", SDL_GetError());
+    }
 
     logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
     background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
@@ -228,9 +537,13 @@ int main(int argc, char *argv[]) {
         SDL_SetTextureAlphaMod(background_texture, 80);
     }
 
-    Mix_Init(MIX_INIT_OGG);
+    if (!(Mix_Init(MIX_INIT_OGG) & MIX_INIT_OGG)) {
+        SDL_Log("Mix_Init did not initialize OGG support: %s", SDL_GetError());
+    }
     SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
-    Mix_OpenAudio(0, &desired_spec);
+    if (!Mix_OpenAudio(0, &desired_spec)) {
+        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
+    }
 
     music = Mix_LoadMUS("assets/background1.ogg");
 
@@ -240,12 +553,10 @@ int main(int argc, char *argv[]) {
     }
 
     SDL_Event event;
-    int running = 1;
-
-    while (running) {
+    while (app_running) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) {
-                running = 0;
+                app_running = 0;
             }
             else if (event.type == SDL_EVENT_JOYSTICK_ADDED ||
                      event.type == SDL_EVENT_JOYSTICK_REMOVED ||
@@ -457,6 +768,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
 
             all_rom_list[all_rom_count].display_name = strdup(entry->d_name);
             all_rom_list[all_rom_count].rom_path = strdup(full_path);
+            all_rom_list[all_rom_count].owns_display_name = 0;
 
             if (!all_rom_list[all_rom_count].display_name || !all_rom_list[all_rom_count].rom_path) {
                 SDL_Log("Failed to strdup string for ROM entry: %s", entry->d_name);
@@ -490,7 +802,15 @@ static void load_all_rom_list(const SystemEntry *sys) {
 
             struct dirent *sub_entry;
             while ((sub_entry = readdir(subdir))) {
-                if (sub_entry->d_type == DT_REG && has_allowed_extension(sub_entry->d_name, sys->allowed_exts)) {
+                char sub_file_path[1024];
+                snprintf(sub_file_path, sizeof(sub_file_path), "%s/%s", sub_path, sub_entry->d_name);
+
+                struct stat sub_st;
+                if (stat(sub_file_path, &sub_st) == -1) {
+                    continue;
+                }
+
+                if (S_ISREG(sub_st.st_mode) && has_allowed_extension(sub_entry->d_name, sys->allowed_exts)) {
                     if (all_rom_count >= capacity) {
                         capacity *= 2;
                         RomEntry *new_all_rom_list = realloc(all_rom_list, capacity * sizeof(RomEntry));
@@ -508,6 +828,7 @@ static void load_all_rom_list(const SystemEntry *sys) {
                     char full_file_path[1024];
                     snprintf(full_file_path, sizeof(full_file_path), "./roms/%s/%s/%s", sys->dir_name, entry->d_name, sub_entry->d_name);
                     all_rom_list[all_rom_count].rom_path = strdup(full_file_path);
+                    all_rom_list[all_rom_count].owns_display_name = 0;
 
                     if (!all_rom_list[all_rom_count].display_name || !all_rom_list[all_rom_count].rom_path) {
                         SDL_Log("Failed to strdup string for sub-ROM entry: %s", sub_entry->d_name);
@@ -554,8 +875,12 @@ static void free_rom_list(void) {
     SDL_Log("free_rom_list called (filtered). rom_list: %p, rom_count: %d", (void*)rom_list, rom_count);
 
     if (rom_list) {
-        // Only free the memory for the RomEntry array itself, not the strings,
-        // as they are merely pointers to strings owned by all_rom_list.
+        for (int i = 0; i < rom_count; ++i) {
+            if (rom_list[i].owns_display_name && rom_list[i].display_name) {
+                SDL_free(rom_list[i].display_name);
+                rom_list[i].display_name = NULL;
+            }
+        }
         SDL_free(rom_list);
         rom_list = NULL;
     }
@@ -584,6 +909,7 @@ static void filter_rom_list(const char *filter_text) {
 
         rom_list[all_rom_count].display_name = strdup("Exit");
         rom_list[all_rom_count].rom_path = NULL;
+        rom_list[all_rom_count].owns_display_name = 1;
 
         if (!rom_list[all_rom_count].display_name) {
             SDL_Log("Failed to strdup 'Exit' for filtered list (empty filter)");
@@ -610,13 +936,10 @@ static void filter_rom_list(const char *filter_text) {
         if (temp_rom_count < (all_rom_count + 1)) { // Ensure space for "Exit"
             temp_rom_list[temp_rom_count].display_name = strdup("Exit");
             temp_rom_list[temp_rom_count].rom_path = NULL;
+            temp_rom_list[temp_rom_count].owns_display_name = 1;
 
             if (!temp_rom_list[temp_rom_count].display_name) {
                 SDL_Log("Failed to strdup 'Exit' for filtered list");
-                // Need to free temp_rom_list and its strdup'd "Exit" if it was allocated
-                for(int i = 0; i < temp_rom_count; ++i) {
-                    if (i == temp_rom_count && temp_rom_list[i].display_name) SDL_free(temp_rom_list[i].display_name); // Only if we strdup'd "Exit"
-                }
                 SDL_free(temp_rom_list);
                 return;
             }
@@ -656,10 +979,15 @@ static void handle_joystick_input(const SDL_Event *event) {
 
     if (event->type == SDL_EVENT_JOYSTICK_ADDED) {
         SDL_Log("Joystick found.");
-        SDL_OpenJoystick(event->jdevice.which);
+        if (!SDL_OpenJoystick(event->jdevice.which)) {
+            SDL_Log("Failed to open joystick id %u: %s", event->jdevice.which, SDL_GetError());
+        }
     } else if (event->type == SDL_EVENT_JOYSTICK_REMOVED) {
         SDL_Log("Joystick removed.");
-        SDL_CloseJoystick(SDL_GetJoystickFromID(event->jdevice.which));
+        SDL_Joystick *js = SDL_GetJoystickFromID(event->jdevice.which);
+        if (js) {
+            SDL_CloseJoystick(js);
+        }
     } else if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
         int direction = 0;
         if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
@@ -679,118 +1007,7 @@ static void handle_joystick_input(const SDL_Event *event) {
             last_input_time = now;
         }
     } else if (event->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event->jbutton.button == 0) {
-        if (in_rom_menu) {
-            if (!rom_list || selected_rom_index < 0 || selected_rom_index >= rom_count) {
-                 SDL_Log("Attempted to access invalid ROM index or rom_list is NULL. Index: %d, Count: %d", selected_rom_index, rom_count);
-                 if (rom_list && rom_count > 0 && selected_rom_index == rom_count - 1) { // Check if it's the "Exit" option
-                     in_rom_menu = 0;
-                     free_rom_list(); // Free filtered list
-                     free_all_rom_list(); // Free master list
-                     input_text[0] = '\0'; // Clear input
-                     return;
-                 }
-                 return;
-            }
-
-            if (rom_list[selected_rom_index].rom_path == NULL) { // "Exit" option
-                in_rom_menu = 0;
-                free_rom_list(); // Free filtered list
-                free_all_rom_list(); // Free master list
-                input_text[0] = '\0'; // Clear input
-                return;
-            }
-
-            const SystemEntry *sys = &systems[selected_system_index];
-            const char *rom_path = rom_list[selected_rom_index].rom_path;
-            struct stat st;
-
-            if (stat(rom_path, &st) == -1) {
-                SDL_Log("Failed to stat ROM path: %s", rom_path);
-                return;
-            }
-
-            char final_rom_path[512] = "";
-
-            if (S_ISDIR(st.st_mode)) {
-                DIR *d = opendir(rom_path);
-
-                if (!d) {
-                    SDL_Log("Failed to open ROM directory for launch: %s", rom_path);
-                    return;
-                }
-                struct dirent *ent;
-                while ((ent = readdir(d))) {
-                    if (ent->d_type == DT_REG && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
-                        snprintf(final_rom_path, sizeof(final_rom_path), "%s/%s", rom_path, ent->d_name);
-                        break;
-                    }
-                }
-                closedir(d);
-            } else if (S_ISREG(st.st_mode)) {
-                snprintf(final_rom_path, sizeof(final_rom_path), "%s", rom_path);
-            }
-
-            if (final_rom_path[0] != '\0') {
-                char cmd[1024];
-                Mix_PauseMusic();
-
-                // NeoGeo is a special case in the sense of running it's games, so I made e if to handle it
-                // we create a empty file named game.neo and put it at bios folder (I don't know why but mame works like this, maybe there's a better way)
-                if (strcmp(sys->mame_sys, "neogeo") == 0) {
-                    char romstrsize[256];
-                    char *last_slash = strrchr(final_rom_path, '/');
-                    char *romdot = strrchr(final_rom_path, '.');
-
-                    strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
-                    romstrsize[(romdot - (last_slash + 1))] = '\0';
-
-                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-
-                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
-                    system(cmd);
-                } else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
-                       // macOS RPCS3 launch
-                        snprintf(cmd, sizeof(cmd), "open -a /Users/auser/Applications/RPCS3/RPCS3.app/Contents/MacOS/launcher --args --game=\"%s\"", final_rom_path);
-                        system(cmd);
-
-                } else {
-                    snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
-                    system(cmd);
-                }
-
-                Mix_ResumeMusic();
-            } else {
-                SDL_Log("No valid ROM file found in directory %s for launch.", rom_path);
-            }
-
-            in_rom_menu = 0;
-            free_rom_list(); // Free filtered list
-            free_all_rom_list(); // Free master list
-            input_text[0] = '\0'; // Clear input
-        } else {
-            int item_count = system_menu_count;
-
-            if (selected_system_index == item_count - 1) {
-                exit(0);
-            } else if (selected_system_index == item_count - 2) {
-                pid_t pid = fork();
-
-                if (pid == 0) {
-                    execl("./cover-scraper", "./cover-scraper", (char *)NULL);
-                    perror("Failed to exec cover-scraper");
-                    _exit(1);
-                } else if (pid > 0) {
-                    int status;
-                    waitpid(pid, &status, 0);
-                } else {
-                    perror("Failed to fork");
-                }
-            } else {
-                load_all_rom_list(&systems[selected_system_index]); // Load all ROMs
-                filter_rom_list(input_text); // Filter initially
-                in_rom_menu = 1;
-            }
-        }
+        handle_current_selection();
         last_input_time = now;
     }
 }
@@ -857,120 +1074,11 @@ static void handle_keyboard_input(const SDL_Event *event) {
                 }
                 last_input_time = now;
             } else if (event->key.scancode == SDL_SCANCODE_RETURN || event->key.scancode == SDL_SCANCODE_KP_ENTER) {
-                if (in_rom_menu) {
-                    if (!rom_list || selected_rom_index < 0 || selected_rom_index >= rom_count) {
-                        SDL_Log("Attempted to access invalid ROM index or rom_list is NULL. Index: %d, Count: %d", selected_rom_index, rom_count);
-                        if (rom_list && rom_count > 0 && selected_rom_index == rom_count - 1) { // Check for "Exit"
-                            in_rom_menu = 0;
-                            free_rom_list(); // Free filtered list
-                            free_all_rom_list(); // Free master list
-                            input_text[0] = '\0'; // Clear input
-                            return;
-                        }
-                        return;
-                    }
-
-                    if (rom_list[selected_rom_index].rom_path == NULL) { // "Exit" option
-                        in_rom_menu = 0;
-                        free_rom_list(); // Free filtered list
-                        free_all_rom_list(); // Free master list
-                        input_text[0] = '\0'; // Clear input
-                        return;
-                    }
-
-                    const SystemEntry *sys = &systems[selected_system_index];
-                    const char *rom_path = rom_list[selected_rom_index].rom_path;
-                    struct stat st;
-                    if (stat(rom_path, &st) == -1) {
-                        SDL_Log("Failed to stat ROM path: %s", rom_path);
-                        return;
-                    }
-
-                    char final_rom_path[512] = "";
-                    if (S_ISDIR(st.st_mode)) {
-                        DIR *d = opendir(rom_path);
-                        if (!d) {
-                            SDL_Log("Failed to open ROM directory for launch: %s", rom_path);
-                            return;
-                        }
-                        struct dirent *ent;
-                        while ((ent = readdir(d))) {
-                            if (ent->d_type == DT_REG && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
-                                snprintf(final_rom_path, sizeof(final_rom_path), "%s/%s", rom_path, ent->d_name);
-                                break;
-                            }
-                        }
-                        closedir(d);
-                    } else if (S_ISREG(st.st_mode)) {
-                        snprintf(final_rom_path, sizeof(final_rom_path), "%s", rom_path);
-                    }
-
-                    if (final_rom_path[0] != '\0') {
-                        char cmd[1024];
-                        Mix_PauseMusic();
-
-                        // NeoGeo is a special case in the sense of running it's games, so I made e if to handle it
-                        // we create a empty file named game.neo and put it at bios folder (I don't know why but mame works like this, maybe there's a better way)
-                        if (strcmp(sys->mame_sys, "neogeo") == 0) {
-                            char romstrsize[256];
-                            char *last_slash = strrchr(final_rom_path, '/');
-                            char *romdot = strrchr(final_rom_path, '.');
-
-                            strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
-                            romstrsize[(romdot - (last_slash + 1))] = '\0';
-
-                            SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-
-                            snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
-                            system(cmd);
-                        }  else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
-                       // macOS RPCS3 launch
-                        snprintf(cmd, sizeof(cmd), "open -a /Users/auser/Applications/RPCS3/RPCS3.app/Contents/MacOS/launcher --args --game=\"%s\"", final_rom_path);
-                        system(cmd);
-                        } else {
-                            snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
-                            system(cmd);
-                        }
-
-                        Mix_ResumeMusic();
-                    } else {
-                        SDL_Log("No valid ROM file found in directory %s for launch.", rom_path);
-                    }
-
-                    in_rom_menu = 0;
-                    free_rom_list(); // Free filtered list
-                    free_all_rom_list(); // Free master list
-                    input_text[0] = '\0'; // Clear input
-                } else {
-                    int item_count = system_menu_count;
-                    if (selected_system_index == item_count - 1) {
-                        exit(0);
-                    } else if (selected_system_index == item_count - 2) {
-                        pid_t pid = fork();
-
-                        if (pid == 0) {
-                            execl("./cover-scraper", "./cover-scraper", (char *)NULL);
-                            perror("Failed to exec cover-scraper");
-                            _exit(1);
-                        } else if (pid > 0) {
-                            int status;
-                            waitpid(pid, &status, 0);
-                        } else {
-                            perror("Failed to fork");
-                        }
-                    } else {
-                        load_all_rom_list(&systems[selected_system_index]); // Load all ROMs
-                        filter_rom_list(input_text); // Filter initially
-                        in_rom_menu = 1;
-                    }
-                }
+                handle_current_selection();
                 last_input_time = now;
             } else if (event->key.scancode == SDL_SCANCODE_ESCAPE) {
                 if (in_rom_menu) {
-                    in_rom_menu = 0;
-                    free_rom_list(); // Free filtered list
-                    free_all_rom_list(); // Free master list
-                    input_text[0] = '\0'; // Clear input
+                    leave_rom_menu();
                 }
                 last_input_time = now;
             }
