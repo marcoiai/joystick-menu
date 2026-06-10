@@ -1,0 +1,1195 @@
+diff --git a/README.md b/README.md
+index 5471af6..ae95b34 100644
+--- a/README.md
++++ b/README.md
+@@ -13,6 +13,23 @@ clang joystick_menu.c -o joystick_menu -I/opt/homebrew/include -L/opt/homebrew/l
+ macOS:
+ clang list_joysticks.c -o list_joysticks -F/Library/Frameworks -framework SDL3 (macOS last to work)
+ 
++Live Cast Bridge on macOS:
++- Install `ffmpeg` with `brew install ffmpeg`
++- Launch `./joystick_menu` or `./start.sh`
++- In the main menu, toggle `Live Cast Bridge: OFF/ON`; selecting it again stops future casts
++- Launch a ROM; the project starts a local HLS bridge and writes the active URL to `live-stream/current-url.txt`
++- Use that URL from `always-player` or any other HLS-capable player on your network
++- You can also stop the bridge from the shell with `./start_macos.sh stop`
++
++Notes:
++- First launch may require macOS Screen Recording permission for `ffmpeg`
++- The default stream is video-only unless you provide an AVFoundation audio device with `JOYSTICK_MENU_LIVE_STREAM_AUDIO_INDEX` or `JOYSTICK_MENU_LIVE_STREAM_AUDIO_NAME`
++- To capture emulator sound on macOS, point the bridge at a virtual audio device such as BlackHole or Loopback, for example:
++  `JOYSTICK_MENU_LIVE_STREAM_AUDIO_NAME="BlackHole 2ch" ./start_macos.sh`
++- If audio sounds fast or glitchy, set the Multi-Output Device, your speakers, and `BlackHole 2ch` to the same sample rate in Audio MIDI Setup. The bridge targets `48,000 Hz` by default.
++- If the capture looks cropped or zoomed, set `JOYSTICK_MENU_LIVE_STREAM_VIDEO_SIZE` to a known-good desktop size such as `1920x1080`
++- Logs and generated HLS files are written under `live-stream/`
++
+ Linux:
+ gcc joystick_menu.c -o joystick_menu -I/usr/local/include -L/usr/local/lib -lSDL3 -lSDL3_image
+ 
+diff --git a/joystick_menu.c b/joystick_menu.c
+index c76ca3a..58b0715 100644
+--- a/joystick_menu.c
++++ b/joystick_menu.c
+@@ -6,7 +6,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <stdarg.h>
+ #include <dirent.h>
++#include <spawn.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <sys/wait.h>
+@@ -31,6 +33,7 @@ static int typing_in_input = 0;
+ static int app_running = 1;
+ 
+ static Uint64 last_input_time = 0;
++extern char **environ;
+ 
+ typedef struct {
+     const char *dir_name;
+@@ -55,8 +58,11 @@ static const SystemEntry systems[] = {
+ static int selected_system_index = 0;
+ static int system_scroll_offset = 0;
+ static int in_rom_menu = 0;
++static int live_stream_enabled = 0;
+ 
+-static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 2;
++static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 3;
++static char launch_status_text[256] = "";
++static int launch_status_is_error = 0;
+ 
+ typedef struct {
+     char *display_name;
+@@ -83,11 +89,26 @@ static int has_allowed_extension(const char *filename, const char *allowed_exts)
+ static void render_text_centered(const char *text, float y, SDL_Color color);
+ static void render_text(const char *text, float x, float y, SDL_Color color);
+ static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
++static void draw_launch_status(int win_h);
+ static int file_exists(const char *path);
+ static void draw_interactive_input_field(void);
+ static SDL_Texture *load_cover_for_rom(const char *rom_path);
+ static void leave_rom_menu(void);
+ static int run_process(const char *const argv[]);
++static int run_process_silent(const char *const argv[]);
++static void clear_launch_status(void);
++static void set_launch_status(int is_error, const char *fmt, ...);
++static void format_command(const char *const argv[], char *buffer, size_t buffer_size);
++static void close_open_joysticks(void);
++static int initialize_frontend_runtime(void);
++static void shutdown_frontend_runtime(void);
++static int live_stream_menu_index(void);
++static int cover_scraper_menu_index(void);
++static int exit_menu_index(void);
++static const char *live_stream_menu_label(void);
++static void toggle_live_stream_bridge(void);
++static int start_live_stream_bridge(void);
++static void stop_live_stream_bridge(void);
+ static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size);
+ static int extract_rom_id(const char *rom_path, char *rom_id, size_t rom_id_size);
+ static const char *find_pcsx2_app_path(void);
+@@ -99,6 +120,26 @@ static void handle_current_selection(void);
+ static void handle_joystick_input(const SDL_Event *event);
+ static void handle_keyboard_input(const SDL_Event *event);
+ 
++static int live_stream_menu_index(void) {
++    return (int)(sizeof(systems) / sizeof(SystemEntry));
++}
++
++static int cover_scraper_menu_index(void) {
++    return live_stream_menu_index() + 1;
++}
++
++static int exit_menu_index(void) {
++    return cover_scraper_menu_index() + 1;
++}
++
++static const char *live_stream_menu_label(void) {
++#ifdef __APPLE__
++    return live_stream_enabled ? "Live Cast Bridge: ON (select to stop)" : "Live Cast Bridge: OFF (select to start)";
++#else
++    return "Live Cast Bridge: macOS only";
++#endif
++}
++
+ static void draw_system_menu(void) {
+     int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h);
+     int item_count = system_menu_count;
+@@ -123,9 +164,11 @@ static void draw_system_menu(void) {
+         if (i == selected_system_index) color.r = color.g = 255;
+ 
+         const char *label = NULL;
+-        if (i < (item_count - 2)) {
++        if (i < live_stream_menu_index()) {
+             label = systems[i].display_name;
+-        } else if (i == (item_count - 2)) {
++        } else if (i == live_stream_menu_index()) {
++            label = live_stream_menu_label();
++        } else if (i == cover_scraper_menu_index()) {
+             label = "Run Cover Scraper";
+         } else {
+             label = "Exit";
+@@ -134,6 +177,7 @@ static void draw_system_menu(void) {
+     }
+ 
+     draw_scrollbar(item_count, visible_lines, system_scroll_offset, start_y, line_height, win_w);
++    draw_launch_status(win_h);
+ }
+ 
+ static void draw_rom_menu(void) {
+@@ -194,6 +238,7 @@ static void draw_rom_menu(void) {
+     }
+ 
+     draw_interactive_input_field(); // Draw input field regardless of ROMs found
++    draw_launch_status(win_h);
+ }
+ 
+ static void draw_interactive_input_field(void) {
+@@ -235,15 +280,47 @@ static void leave_rom_menu(void) {
+     input_text[0] = '\0';
+ }
+ 
+-static int run_process(const char *const argv[]) {
+-    pid_t pid = fork();
+-    if (pid == 0) {
+-        execvp(argv[0], (char *const *)argv);
+-        perror("Failed to execute process");
+-        _exit(127);
+-    }
+-    if (pid < 0) {
+-        perror("Failed to fork");
++static void clear_launch_status(void) {
++    launch_status_text[0] = '\0';
++    launch_status_is_error = 0;
++}
++
++static void set_launch_status(int is_error, const char *fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(launch_status_text, sizeof(launch_status_text), fmt, args);
++    va_end(args);
++    launch_status_is_error = is_error;
++}
++
++static void format_command(const char *const argv[], char *buffer, size_t buffer_size) {
++    size_t used = 0;
++    if (!buffer || buffer_size == 0) {
++        return;
++    }
++
++    buffer[0] = '\0';
++    for (int i = 0; argv && argv[i]; ++i) {
++        int written = snprintf(buffer + used, buffer_size - used, "%s%s", i == 0 ? "" : " ", argv[i]);
++        if (written < 0) {
++            break;
++        }
++        if ((size_t)written >= buffer_size - used) {
++            used = buffer_size - 1;
++            break;
++        }
++        used += (size_t)written;
++    }
++}
++
++static int run_process_internal(const char *const argv[], int log_success) {
++    char command[2048];
++    format_command(argv, command, sizeof(command));
++
++    pid_t pid = 0;
++    int spawn_result = posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ);
++    if (spawn_result != 0) {
++        SDL_Log("Failed to launch process (%d): %s", spawn_result, command);
+         return 0;
+     }
+ 
+@@ -253,14 +330,176 @@ static int run_process(const char *const argv[]) {
+         return 0;
+     }
+ 
+-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+-        SDL_Log("Process returned non-zero status for command: %s", argv[0]);
++    if (!WIFEXITED(status)) {
++        if (WIFSIGNALED(status)) {
++            SDL_Log("Process was terminated by signal %d: %s", WTERMSIG(status), command);
++        } else {
++            SDL_Log("Process ended unexpectedly: %s", command);
++        }
++        return 0;
++    }
++
++    if (WEXITSTATUS(status) != 0) {
++        SDL_Log("Process exited with status %d for command: %s", WEXITSTATUS(status), command);
+         return 0;
+     }
+ 
++    if (log_success) {
++        SDL_Log("Process finished successfully: %s", command);
++    }
+     return 1;
+ }
+ 
++static int run_process(const char *const argv[]) {
++    return run_process_internal(argv, 1);
++}
++
++static int run_process_silent(const char *const argv[]) {
++    return run_process_internal(argv, 0);
++}
++
++static void close_open_joysticks(void) {
++    int joystick_count = 0;
++    SDL_JoystickID *joystick_ids = SDL_GetJoysticks(&joystick_count);
++
++    if (!joystick_ids) {
++        return;
++    }
++
++    for (int i = 0; i < joystick_count; ++i) {
++        SDL_Joystick *joystick = SDL_GetJoystickFromID(joystick_ids[i]);
++        if (joystick) {
++            SDL_CloseJoystick(joystick);
++        }
++    }
++
++    SDL_free(joystick_ids);
++}
++
++static int initialize_frontend_runtime(void) {
++    if (!window || !renderer) {
++        if (!SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer)) {
++            SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
++            return 0;
++        }
++    }
++
++    if (!font) {
++        font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
++        if (!font) {
++            SDL_Log("TTF_OpenFont failed: %s", SDL_GetError());
++            return 0;
++        }
++    }
++
++    if (!logo_texture) {
++        logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
++    }
++
++    if (!background_texture) {
++        background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
++        if (background_texture) {
++            SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
++            SDL_SetTextureAlphaMod(background_texture, 80);
++        }
++    }
++
++    if (!(Mix_Init(MIX_INIT_OGG) & MIX_INIT_OGG)) {
++        SDL_Log("Mix_Init did not initialize OGG support: %s", SDL_GetError());
++    }
++
++    SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
++    if (!Mix_OpenAudio(0, &desired_spec)) {
++        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
++    }
++
++    if (!music) {
++        music = Mix_LoadMUS("assets/background1.ogg");
++    }
++
++    if (music && !Mix_PlayingMusic()) {
++        Mix_VolumeMusic(64);
++        Mix_PlayMusic(music, -1);
++    }
++
++    return 1;
++}
++
++static void shutdown_frontend_runtime(void) {
++    typing_in_input = 0;
++    if (window) {
++        SDL_StopTextInput(window);
++    }
++
++    close_open_joysticks();
++
++    if (music) {
++        Mix_HaltMusic();
++        Mix_FreeMusic(music);
++        music = NULL;
++    }
++    Mix_CloseAudio();
++    Mix_Quit();
++
++    if (cover_texture) {
++        SDL_DestroyTexture(cover_texture);
++        cover_texture = NULL;
++    }
++    if (logo_texture) {
++        SDL_DestroyTexture(logo_texture);
++        logo_texture = NULL;
++    }
++    if (background_texture) {
++        SDL_DestroyTexture(background_texture);
++        background_texture = NULL;
++    }
++    if (font) {
++        TTF_CloseFont(font);
++        font = NULL;
++    }
++    if (renderer) {
++        SDL_DestroyRenderer(renderer);
++        renderer = NULL;
++    }
++    if (window) {
++        SDL_DestroyWindow(window);
++        window = NULL;
++    }
++}
++
++static int start_live_stream_bridge(void) {
++#ifdef __APPLE__
++    const char *const argv[] = { "./scripts/live-stream/start-macos.sh", NULL };
++    return run_process_silent(argv);
++#else
++    return 0;
++#endif
++}
++
++static void stop_live_stream_bridge(void) {
++#ifdef __APPLE__
++    const char *const argv[] = { "./scripts/live-stream/stop-macos.sh", "--quiet", NULL };
++    if (!run_process_silent(argv)) {
++        SDL_Log("Live Cast Bridge stop script reported a problem.");
++    }
++#endif
++}
++
++static void toggle_live_stream_bridge(void) {
++#ifdef __APPLE__
++    live_stream_enabled = !live_stream_enabled;
++    if (!live_stream_enabled) {
++        stop_live_stream_bridge();
++        set_launch_status(0, "Live Cast disabled.");
++        return;
++    }
++
++    set_launch_status(0, "Live Cast armed. Launch a ROM to stream, or select again to stop.");
++#else
++    set_launch_status(1, "Live Cast Bridge currently needs macOS, ffmpeg, and python3.");
++#endif
++}
++
+ static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size) {
+     struct stat st;
+     if (stat(rom_path, &st) == -1) {
+@@ -393,26 +632,48 @@ static void launch_selected_rom(void) {
+     const SystemEntry *sys = &systems[selected_system_index];
+     const char *rom_path = rom_list[selected_rom_index].rom_path;
+     char final_rom_path[1024] = "";
++    int launched = 0;
++    int previous_music_volume = Mix_VolumeMusic(-1);
++    int was_music_playing = Mix_PlayingMusic();
++#ifdef __APPLE__
++    int live_stream_started = 0;
++    int live_stream_failed = 0;
++    int frontend_runtime_shutdown = 0;
++#endif
+ 
+     if (!resolve_launch_rom_path(sys, rom_path, final_rom_path, sizeof(final_rom_path))) {
++        set_launch_status(1, "Launch failed: ROM file could not be resolved");
+         return;
+     }
+     const char *launch_rom_path = resolve_absolute_path(final_rom_path);
+ 
+-    int previous_music_volume = Mix_VolumeMusic(-1);
+-    int was_music_playing = Mix_PlayingMusic();
++#ifdef __APPLE__
++    if (live_stream_enabled) {
++        shutdown_frontend_runtime();
++        frontend_runtime_shutdown = 1;
++        live_stream_started = start_live_stream_bridge();
++        if (!live_stream_started) {
++            live_stream_failed = 1;
++            SDL_Log("Live Cast Bridge failed to start. Continuing with emulator launch.");
++        }
++    } else if (was_music_playing) {
++        Mix_VolumeMusic(0);
++    }
++#else
+     if (was_music_playing) {
+         Mix_VolumeMusic(0);
+     }
++#endif
+ 
+     if (strcmp(sys->mame_sys, "neogeo") == 0) {
+         char rom_id[256];
+         if (!extract_rom_id(final_rom_path, rom_id, sizeof(rom_id))) {
+             SDL_Log("Failed to parse NeoGeo ROM id from path: %s", final_rom_path);
++            set_launch_status(1, "Launch failed: invalid Neo Geo ROM name");
+         } else {
+             const char *const argv[] = { "mame", sys->mame_sys, rom_id, NULL };
+             SDL_Log("mame %s %s", sys->mame_sys, rom_id);
+-            run_process(argv);
++            launched = run_process(argv);
+         }
+     } else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
+         char game_arg[1200];
+@@ -426,7 +687,7 @@ static void launch_selected_rom(void) {
+             game_arg,
+             NULL
+         };
+-        run_process(argv);
++        launched = run_process(argv);
+     } else if (strcmp(sys->mame_sys, "pcsx2") == 0) {
+         const char *pcsx2_bin = find_pcsx2_binary_path();
+         if (pcsx2_bin) {
+@@ -440,7 +701,7 @@ static void launch_selected_rom(void) {
+                 launch_rom_path,
+                 NULL
+             };
+-            int launched = run_process(argv_nogui);
++            launched = run_process(argv_nogui);
+             if (!launched) {
+                 const char *const argv_gui[] = {
+                     pcsx2_bin,
+@@ -451,7 +712,7 @@ static void launch_selected_rom(void) {
+                     launch_rom_path,
+                     NULL
+                 };
+-                run_process(argv_gui);
++                launched = run_process(argv_gui);
+             }
+         } else {
+             const char *const argv[] = {
+@@ -467,17 +728,45 @@ static void launch_selected_rom(void) {
+                 launch_rom_path,
+                 NULL
+             };
+-            run_process(argv);
++            launched = run_process(argv);
+         }
+     } else {
+         const char *const argv[] = { "mame", sys->mame_sys, sys->launch_arg, launch_rom_path, NULL };
+-        run_process(argv);
++        launched = run_process(argv);
+     }
+ 
++#ifdef __APPLE__
++    if (live_stream_enabled) {
++        stop_live_stream_bridge();
++    }
++    if (frontend_runtime_shutdown) {
++        if (!initialize_frontend_runtime()) {
++            set_launch_status(1, "Launch failed: could not restore menu");
++            app_running = 0;
++            return;
++        }
++    } else if (was_music_playing) {
++        Mix_VolumeMusic(previous_music_volume >= 0 ? previous_music_volume : 64);
++    }
++    if (live_stream_enabled && !live_stream_started && launched) {
++        set_launch_status(1, "Live Cast Bridge did not start. Check live-stream/logs.");
++    }
++#else
+     if (was_music_playing) {
+         Mix_VolumeMusic(previous_music_volume >= 0 ? previous_music_volume : 64);
+     }
+-    leave_rom_menu();
++#endif
++
++    if (launched) {
++#ifdef __APPLE__
++        if (!live_stream_failed) {
++            clear_launch_status();
++        }
++#else
++        clear_launch_status();
++#endif
++        leave_rom_menu();
++    }
+ }
+ 
+ static void handle_current_selection(void) {
+@@ -486,13 +775,17 @@ static void handle_current_selection(void) {
+         return;
+     }
+ 
+-    int item_count = system_menu_count;
+-    if (selected_system_index == item_count - 1) {
++    if (selected_system_index == exit_menu_index()) {
+         app_running = 0;
+         return;
+     }
+ 
+-    if (selected_system_index == item_count - 2) {
++    if (selected_system_index == live_stream_menu_index()) {
++        toggle_live_stream_bridge();
++        return;
++    }
++
++    if (selected_system_index == cover_scraper_menu_index()) {
+         const char *const argv[] = { "./cover-scraper", NULL };
+         run_process(argv);
+         return;
+@@ -500,6 +793,7 @@ static void handle_current_selection(void) {
+ 
+     load_all_rom_list(&systems[selected_system_index]);
+     filter_rom_list(input_text);
++    clear_launch_status();
+     in_rom_menu = 1;
+ }
+ 
+@@ -507,6 +801,17 @@ int main(int argc, char *argv[]) {
+     (void)argc;
+     (void)argv;
+ 
++#ifdef __APPLE__
++    const char *preserve_live_stream = getenv("JOYSTICK_MENU_PRESERVE_LIVE_STREAM");
++    if (!(preserve_live_stream && preserve_live_stream[0] != '\0' && strcmp(preserve_live_stream, "0") != 0)) {
++        stop_live_stream_bridge();
++        live_stream_enabled = 0;
++    } else {
++        live_stream_enabled = 1;
++    }
++#endif
++    clear_launch_status();
++
+     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_AUDIO)) {
+         SDL_Log("SDL_Init failed: %s", SDL_GetError());
+         return 1;
+@@ -518,39 +823,11 @@ int main(int argc, char *argv[]) {
+         return 1;
+     }
+ 
+-    if (!SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer)) {
+-        SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
++    if (!initialize_frontend_runtime()) {
+         TTF_Quit();
+         SDL_Quit();
+         return 1;
+     }
+-    font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
+-    if (!font) {
+-        SDL_Log("TTF_OpenFont failed: %s", SDL_GetError());
+-    }
+-
+-    logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
+-    background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
+-
+-    if (background_texture) {
+-        SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
+-        SDL_SetTextureAlphaMod(background_texture, 80);
+-    }
+-
+-    if (!(Mix_Init(MIX_INIT_OGG) & MIX_INIT_OGG)) {
+-        SDL_Log("Mix_Init did not initialize OGG support: %s", SDL_GetError());
+-    }
+-    SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
+-    if (!Mix_OpenAudio(0, &desired_spec)) {
+-        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
+-    }
+-
+-    music = Mix_LoadMUS("assets/background1.ogg");
+-
+-    if (music) {
+-        Mix_VolumeMusic(64);
+-        Mix_PlayMusic(music, -1);
+-    }
+ 
+     SDL_Event event;
+     while (app_running) {
+@@ -600,14 +877,12 @@ int main(int argc, char *argv[]) {
+ 
+     free_all_rom_list(); // Free the master list
+     free_rom_list(); // Free the filtered list (if anything is left)
+-    TTF_CloseFont(font);
+-    SDL_DestroyTexture(logo_texture);
+-    SDL_DestroyTexture(background_texture);
+-    SDL_DestroyTexture(cover_texture);
+-
+-    Mix_FreeMusic(music);
+-    Mix_CloseAudio();
+-    Mix_Quit();
++#ifdef __APPLE__
++    if (live_stream_enabled) {
++        stop_live_stream_bridge();
++    }
++#endif
++    shutdown_frontend_runtime();
+     TTF_Quit();
+     SDL_Quit();
+ 
+@@ -675,6 +950,17 @@ static void render_text(const char *text, float x, float y, SDL_Color color) {
+     SDL_DestroyTexture(texture);
+ }
+ 
++static void draw_launch_status(int win_h) {
++    if (launch_status_text[0] == '\0') {
++        return;
++    }
++
++    SDL_Color color = launch_status_is_error
++        ? (SDL_Color){255, 120, 120, 255}
++        : (SDL_Color){170, 220, 170, 255};
++    render_text_centered(launch_status_text, win_h - FONT_SIZE - 35, color);
++}
++
+ static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w) {
+     if (item_count <= visible_lines) return;
+ 
+diff --git a/start_macos.sh b/start_macos.sh
+new file mode 100755
+index 0000000..4d8bdea
+--- /dev/null
++++ b/start_macos.sh
+@@ -0,0 +1,57 @@
++#!/bin/bash
++
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd "${ROOT_DIR}"
++
++export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
++
++BUILD_CMD=(
++  gcc
++  joystick_menu.c
++  -o
++  joystick_menu
++)
++
++while IFS= read -r token; do
++  BUILD_CMD+=("${token}")
++done < <(pkg-config --cflags --libs sdl3 sdl3-image sdl3-mixer sdl3-ttf)
++
++ensure_build() {
++  if [[ ! -x "./joystick_menu" || "./joystick_menu.c" -nt "./joystick_menu" ]]; then
++    echo "Building joystick_menu..."
++    "${BUILD_CMD[@]}"
++  fi
++}
++
++MODE="${1:-menu}"
++
++case "${MODE}" in
++  menu)
++    ./scripts/live-stream/stop-macos.sh --quiet >/dev/null 2>&1 || true
++    ensure_build
++    exec ./joystick_menu
++    ;;
++  live|cast|bridge)
++    ./scripts/live-stream/stop-macos.sh --quiet >/dev/null 2>&1 || true
++    LIVE_URL="$(./scripts/live-stream/start-macos.sh)"
++    echo "Live Cast URL: ${LIVE_URL}"
++    echo "Load that URL in your player/cast workflow, then close the menu when done."
++    ensure_build
++    export JOYSTICK_MENU_PRESERVE_LIVE_STREAM=1
++    exec ./joystick_menu
++    ;;
++  stop)
++    exec ./scripts/live-stream/stop-macos.sh
++    ;;
++  *)
++    cat <<'EOF'
++Usage:
++  ./start_macos.sh          Start the menu normally
++  ./start_macos.sh live     Start the Live Cast Bridge, then launch the menu
++  ./start_macos.sh stop     Stop the Live Cast Bridge
++EOF
++    exit 1
++    ;;
++esac
+diff --git a/stop_macos.sh b/stop_macos.sh
+new file mode 100755
+index 0000000..6617cd8
+--- /dev/null
++++ b/stop_macos.sh
+@@ -0,0 +1,8 @@
++#!/bin/bash
++
++set -euo pipefail
++
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++cd "${ROOT_DIR}"
++
++exec ./scripts/live-stream/stop-macos.sh "$@"
+diff --git a/scripts/live-stream/start-macos.sh b/scripts/live-stream/start-macos.sh
+new file mode 100755
+index 0000000..56dd24b
+--- /dev/null
++++ b/scripts/live-stream/start-macos.sh
+@@ -0,0 +1,349 @@
++#!/bin/bash
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
++STATE_DIR="${ROOT_DIR}/live-stream"
++RUN_DIR="${STATE_DIR}/run"
++LOG_DIR="${STATE_DIR}/logs"
++PUBLIC_DIR="${STATE_DIR}/public"
++LIVE_DIR="${PUBLIC_DIR}/live"
++
++PORT="${JOYSTICK_MENU_LIVE_STREAM_PORT:-8600}"
++FPS="${JOYSTICK_MENU_LIVE_STREAM_FPS:-30}"
++WIDTH="${JOYSTICK_MENU_LIVE_STREAM_WIDTH:-1280}"
++SEGMENT_SECONDS="${JOYSTICK_MENU_LIVE_STREAM_SEGMENT_SECONDS:-1}"
++SEGMENT_LIST_SIZE="${JOYSTICK_MENU_LIVE_STREAM_LIST_SIZE:-5}"
++CAPTURE_CURSOR="${JOYSTICK_MENU_LIVE_STREAM_CAPTURE_CURSOR:-0}"
++VIDEO_SIZE="${JOYSTICK_MENU_LIVE_STREAM_VIDEO_SIZE:-}"
++AUDIO_SAMPLE_RATE="${JOYSTICK_MENU_LIVE_STREAM_AUDIO_SAMPLE_RATE:-48000}"
++AUDIO_FILTER="${JOYSTICK_MENU_LIVE_STREAM_AUDIO_FILTER:-aresample=async=1000:min_hard_comp=0.100000:first_pts=0}"
++SCREEN_INDEX_OVERRIDE="${JOYSTICK_MENU_LIVE_STREAM_SCREEN_INDEX:-}"
++SCREEN_NAME_OVERRIDE="${JOYSTICK_MENU_LIVE_STREAM_SCREEN_NAME:-}"
++AUDIO_INDEX_OVERRIDE="${JOYSTICK_MENU_LIVE_STREAM_AUDIO_INDEX:-}"
++AUDIO_NAME_OVERRIDE="${JOYSTICK_MENU_LIVE_STREAM_AUDIO_NAME:-}"
++START_TIMEOUT_SECONDS="${JOYSTICK_MENU_LIVE_STREAM_START_TIMEOUT_SECONDS:-8}"
++
++mkdir -p "${RUN_DIR}" "${LOG_DIR}" "${LIVE_DIR}"
++
++find_binary() {
++  local env_value="$1"
++  shift
++
++  if [[ -n "${env_value}" && -x "${env_value}" ]]; then
++    printf '%s\n' "${env_value}"
++    return 0
++  fi
++
++  local candidate=""
++  candidate="$(command -v "$1" 2>/dev/null || true)"
++  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
++    printf '%s\n' "${candidate}"
++    return 0
++  fi
++
++  shift
++  for candidate in "$@"; do
++    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
++      printf '%s\n' "${candidate}"
++      return 0
++    fi
++  done
++
++  return 1
++}
++
++FFMPEG_BIN="$(find_binary "${JOYSTICK_MENU_FFMPEG:-}" ffmpeg /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg /opt/local/bin/ffmpeg)" || {
++  echo "Could not find ffmpeg. Set JOYSTICK_MENU_FFMPEG or install ffmpeg." >&2
++  exit 1
++}
++
++PYTHON_BIN="$(find_binary "${JOYSTICK_MENU_PYTHON:-}" python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3)" || {
++  echo "Could not find python3. Set JOYSTICK_MENU_PYTHON or install python3." >&2
++  exit 1
++}
++
++DEVICE_LOG="${LOG_DIR}/ffmpeg-devices.log"
++DEVICE_LISTING="$("${FFMPEG_BIN}" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 || true)"
++printf '%s\n' "${DEVICE_LISTING}" > "${DEVICE_LOG}"
++
++select_avfoundation_device() {
++  local media_kind="$1"
++  local preferred_index="$2"
++  local preferred_name="$3"
++
++  DEVICE_LISTING="${DEVICE_LISTING}" "${PYTHON_BIN}" - "${media_kind}" "${preferred_index}" "${preferred_name}" <<'PY'
++import os
++import re
++import sys
++
++media_kind = sys.argv[1].strip().lower()
++preferred_index = sys.argv[2].strip()
++preferred_name = sys.argv[3].strip().lower()
++devices = []
++in_section = False
++
++start_marker = f"AVFoundation {media_kind} devices"
++stop_marker = "AVFoundation audio devices" if media_kind == "video" else None
++
++for line in os.environ.get("DEVICE_LISTING", "").splitlines():
++    if start_marker in line:
++        in_section = True
++        continue
++    if stop_marker and stop_marker in line:
++        break
++    if not in_section:
++        continue
++
++    match = re.search(r"\[(\d+)\]\s+(.+)$", line)
++    if not match:
++        continue
++    devices.append((int(match.group(1)), match.group(2).strip()))
++
++if preferred_index:
++    for index, name in devices:
++        if str(index) == preferred_index:
++            print(f"{index}|{name}")
++            raise SystemExit(0)
++
++if preferred_name:
++    for index, name in devices:
++        if preferred_name in name.lower():
++            print(f"{index}|{name}")
++            raise SystemExit(0)
++
++if media_kind == "video":
++    for index, name in devices:
++        lowered = name.lower()
++        if "capture screen" in lowered or "screen capture" in lowered:
++            print(f"{index}|{name}")
++            raise SystemExit(0)
++
++    if devices:
++        index, name = devices[-1]
++        print(f"{index}|{name}")
++        raise SystemExit(0)
++
++raise SystemExit(1)
++PY
++}
++
++SCREEN_DEVICE_INFO="$(select_avfoundation_device "video" "${SCREEN_INDEX_OVERRIDE}" "${SCREEN_NAME_OVERRIDE}")" || {
++  cat >&2 <<EOF
++Could not find a macOS screen capture device in ffmpeg.
++This usually means macOS Screen Recording permission is missing for the app that
++launches this script, or the terminal needs to be fully restarted after the
++permission was granted.
++
++Check:
++  System Settings -> Privacy & Security -> Screen Recording
++
++Then allow your terminal app (Terminal, iTerm, etc.) and, if needed, fully quit
++and reopen it before trying again.
++
++Device log: ${DEVICE_LOG}
++EOF
++  exit 1
++}
++
++SCREEN_INDEX="${SCREEN_DEVICE_INFO%%|*}"
++SCREEN_NAME="${SCREEN_DEVICE_INFO#*|}"
++AUDIO_INDEX=""
++AUDIO_NAME=""
++
++if [[ -n "${AUDIO_INDEX_OVERRIDE}" || -n "${AUDIO_NAME_OVERRIDE}" ]]; then
++  AUDIO_DEVICE_INFO="$(select_avfoundation_device "audio" "${AUDIO_INDEX_OVERRIDE}" "${AUDIO_NAME_OVERRIDE}")" || {
++    cat >&2 <<EOF
++Could not find the requested macOS audio capture device in ffmpeg.
++Set JOYSTICK_MENU_LIVE_STREAM_AUDIO_INDEX or JOYSTICK_MENU_LIVE_STREAM_AUDIO_NAME
++to one of the devices listed in:
++
++  ${DEVICE_LOG}
++EOF
++    exit 1
++  }
++
++  AUDIO_INDEX="${AUDIO_DEVICE_INFO%%|*}"
++  AUDIO_NAME="${AUDIO_DEVICE_INFO#*|}"
++fi
++
++HOST_NAME="$(scutil --get LocalHostName 2>/dev/null || true)"
++DEFAULT_INTERFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
++LAN_IP=""
++
++if [[ -n "${DEFAULT_INTERFACE}" ]]; then
++  LAN_IP="$(ipconfig getifaddr "${DEFAULT_INTERFACE}" 2>/dev/null || true)"
++fi
++
++if [[ -z "${LAN_IP}" ]]; then
++  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
++fi
++
++CURRENT_URL=""
++HOSTNAME_URL=""
++if [[ -n "${LAN_IP}" ]]; then
++  CURRENT_URL="http://${LAN_IP}:${PORT}/live/index.m3u8"
++fi
++if [[ -n "${HOST_NAME}" ]]; then
++  HOSTNAME_URL="http://${HOST_NAME}.local:${PORT}/live/index.m3u8"
++fi
++if [[ -z "${CURRENT_URL}" ]]; then
++  CURRENT_URL="${HOSTNAME_URL:-http://127.0.0.1:${PORT}/live/index.m3u8}"
++fi
++
++SERVER_LOG="${LOG_DIR}/http-server.log"
++FFMPEG_LOG="${LOG_DIR}/ffmpeg-live.log"
++
++: > "${SERVER_LOG}"
++: > "${FFMPEG_LOG}"
++
++log_ffmpeg() {
++  local message="$1"
++  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${message}" >>"${FFMPEG_LOG}"
++}
++
++"${SCRIPT_DIR}/stop-macos.sh" --quiet >/dev/null 2>&1 || true
++
++rm -rf "${LIVE_DIR}"
++mkdir -p "${LIVE_DIR}"
++
++nohup "${PYTHON_BIN}" "${SCRIPT_DIR}/http_server.py" \
++  --bind 0.0.0.0 \
++  --port "${PORT}" \
++  --directory "${PUBLIC_DIR}" >>"${SERVER_LOG}" 2>&1 &
++SERVER_PID=$!
++printf '%s\n' "${SERVER_PID}" > "${RUN_DIR}/http-server.pid"
++
++sleep 0.3
++if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
++  echo "The local HLS server failed to start. See ${SERVER_LOG}." >&2
++  exit 1
++fi
++
++INPUT_DEVICE="${SCREEN_INDEX}:none"
++if [[ -n "${AUDIO_INDEX}" ]]; then
++  INPUT_DEVICE="${SCREEN_INDEX}:${AUDIO_INDEX}"
++fi
++
++VIDEO_FILTER="setsar=1,fps=${FPS},setpts=N/(${FPS}*TB)"
++if [[ "${WIDTH}" =~ ^[0-9]+$ ]] && (( WIDTH > 0 )); then
++  VIDEO_FILTER="scale=${WIDTH}:-2:flags=lanczos,${VIDEO_FILTER}"
++fi
++
++FFMPEG_ARGS=(
++  -f avfoundation
++)
++
++if [[ -n "${VIDEO_SIZE}" ]]; then
++  FFMPEG_ARGS+=(
++    -video_size "${VIDEO_SIZE}"
++  )
++fi
++
++FFMPEG_ARGS+=(
++  -pixel_format uyvy422
++  -capture_cursor "${CAPTURE_CURSOR}"
++  -i "${INPUT_DEVICE}"
++)
++
++FFMPEG_ARGS+=(
++  -vf "${VIDEO_FILTER}"
++  -c:v libx264
++  -preset ultrafast
++  -tune zerolatency
++  -pix_fmt yuv420p
++  -g "${FPS}"
++  -keyint_min "${FPS}"
++  -sc_threshold 0
++)
++
++if [[ -n "${AUDIO_INDEX}" ]]; then
++  FFMPEG_ARGS+=(
++    -af "${AUDIO_FILTER}"
++    -c:a aac
++    -b:a 160k
++    -ac 2
++    -ar "${AUDIO_SAMPLE_RATE}"
++  )
++fi
++
++FFMPEG_ARGS+=(
++  -f hls
++  -hls_time "${SEGMENT_SECONDS}"
++  -hls_list_size "${SEGMENT_LIST_SIZE}"
++  -hls_flags delete_segments
++  "${LIVE_DIR}/index.m3u8"
++)
++
++format_command() {
++  local out=""
++  local arg=""
++  for arg in "$@"; do
++    if [[ -z "${out}" ]]; then
++      out="$(printf '%q' "${arg}")"
++    else
++      out="${out} $(printf '%q' "${arg}")"
++    fi
++  done
++  printf '%s\n' "${out}"
++}
++
++FFMPEG_COMMAND="$(format_command "${FFMPEG_BIN}" "${FFMPEG_ARGS[@]}")"
++log_ffmpeg "Selected screen device [${SCREEN_INDEX}] ${SCREEN_NAME}"
++if [[ -n "${AUDIO_INDEX}" ]]; then
++  log_ffmpeg "Selected audio device [${AUDIO_INDEX}] ${AUDIO_NAME}"
++else
++  log_ffmpeg "Audio capture disabled"
++fi
++log_ffmpeg "FFmpeg command started: ${FFMPEG_COMMAND}"
++
++nohup "${FFMPEG_BIN}" "${FFMPEG_ARGS[@]}" >>"${FFMPEG_LOG}" 2>&1 &
++FFMPEG_PID=$!
++printf '%s\n' "${FFMPEG_PID}" > "${RUN_DIR}/ffmpeg.pid"
++log_ffmpeg "FFmpeg PID: ${FFMPEG_PID}"
++
++READY=0
++POLL_COUNT=$(( START_TIMEOUT_SECONDS * 10 ))
++for _ in $(seq 1 "${POLL_COUNT}"); do
++  if [[ -f "${LIVE_DIR}/index.m3u8" ]]; then
++    READY=1
++    break
++  fi
++
++  if ! kill -0 "${FFMPEG_PID}" 2>/dev/null; then
++    log_ffmpeg "index.m3u8 did not appear because FFmpeg exited early."
++    "${SCRIPT_DIR}/stop-macos.sh" --quiet >/dev/null 2>&1 || true
++    echo "ffmpeg stopped before the HLS playlist was created. See ${FFMPEG_LOG}." >&2
++    exit 1
++  fi
++
++  sleep 0.1
++done
++
++if [[ "${READY}" -ne 1 ]]; then
++  log_ffmpeg "index.m3u8 did not appear before timeout (${START_TIMEOUT_SECONDS}s)."
++  "${SCRIPT_DIR}/stop-macos.sh" --quiet >/dev/null 2>&1 || true
++  echo "Timed out waiting for live/index.m3u8. See ${FFMPEG_LOG}." >&2
++  exit 1
++fi
++
++log_ffmpeg "index.m3u8 appeared at ${LIVE_DIR}/index.m3u8"
++
++printf '%s\n' "${CURRENT_URL}" > "${STATE_DIR}/current-url.txt"
++if [[ -n "${HOSTNAME_URL}" ]]; then
++  printf '%s\n' "${HOSTNAME_URL}" > "${STATE_DIR}/hostname-url.txt"
++fi
++
++cat > "${STATE_DIR}/status.txt" <<EOF
++state=running
++port=${PORT}
++screen_index=${SCREEN_INDEX}
++screen_name=${SCREEN_NAME}
++audio_index=${AUDIO_INDEX}
++audio_name=${AUDIO_NAME}
++current_url=${CURRENT_URL}
++hostname_url=${HOSTNAME_URL}
++EOF
++
++printf '%s\n' "${CURRENT_URL}"
+diff --git a/scripts/live-stream/stop-macos.sh b/scripts/live-stream/stop-macos.sh
+new file mode 100755
+index 0000000..e843633
+--- /dev/null
++++ b/scripts/live-stream/stop-macos.sh
+@@ -0,0 +1,72 @@
++#!/bin/bash
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
++STATE_DIR="${ROOT_DIR}/live-stream"
++RUN_DIR="${STATE_DIR}/run"
++LOG_DIR="${STATE_DIR}/logs"
++LIVE_DIR="${STATE_DIR}/public/live"
++QUIET="${1:-}"
++FFMPEG_LOG="${LOG_DIR}/ffmpeg-live.log"
++
++mkdir -p "${LOG_DIR}"
++
++log_ffmpeg() {
++  local message="$1"
++  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${message}" >>"${FFMPEG_LOG}"
++}
++
++stop_pid_file() {
++  local pid_file="$1"
++  local label="$2"
++  local pid=""
++
++  if [[ ! -f "${pid_file}" ]]; then
++    return 0
++  fi
++
++  pid="$(tr -d '[:space:]' < "${pid_file}")"
++  rm -f "${pid_file}"
++
++  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
++    return 0
++  fi
++
++  if [[ "${label}" == "ffmpeg" ]]; then
++    log_ffmpeg "Stopping FFmpeg PID ${pid} with SIGTERM"
++  fi
++  kill "${pid}" 2>/dev/null || true
++  for _ in $(seq 1 20); do
++    if ! kill -0 "${pid}" 2>/dev/null; then
++      if [[ "${label}" == "ffmpeg" ]]; then
++        log_ffmpeg "FFmpeg PID ${pid} stopped cleanly"
++      fi
++      return 0
++    fi
++    sleep 0.1
++  done
++
++  if [[ "${label}" == "ffmpeg" ]]; then
++    log_ffmpeg "FFmpeg PID ${pid} did not exit after SIGTERM; sending SIGKILL"
++  fi
++  kill -9 "${pid}" 2>/dev/null || true
++  if [[ "${label}" == "ffmpeg" ]]; then
++    log_ffmpeg "FFmpeg PID ${pid} stopped after SIGKILL"
++  fi
++}
++
++stop_pid_file "${RUN_DIR}/ffmpeg.pid" "ffmpeg"
++stop_pid_file "${RUN_DIR}/http-server.pid" "http-server"
++
++rm -rf "${LIVE_DIR}"
++mkdir -p "${LIVE_DIR}"
++
++cat > "${STATE_DIR}/status.txt" <<EOF
++state=stopped
++EOF
++
++if [[ "${QUIET}" != "--quiet" ]]; then
++  printf '%s\n' "Live Cast bridge stopped."
++fi
+diff --git a/scripts/live-stream/http_server.py b/scripts/live-stream/http_server.py
+new file mode 100755
+index 0000000..67ac070
+--- /dev/null
++++ b/scripts/live-stream/http_server.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++
++import argparse
++from functools import partial
++from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
++
++
++class HLSRequestHandler(SimpleHTTPRequestHandler):
++    extensions_map = dict(SimpleHTTPRequestHandler.extensions_map)
++    extensions_map.update({
++        ".m3u8": "application/vnd.apple.mpegurl",
++        ".ts": "video/mp2t",
++    })
++
++    def end_headers(self):
++        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
++        self.send_header("Pragma", "no-cache")
++        self.send_header("Expires", "0")
++        self.send_header("Access-Control-Allow-Origin", "*")
++        super().end_headers()
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Serve joystick-menu live HLS output.")
++    parser.add_argument("--bind", default="127.0.0.1", help="Bind address")
++    parser.add_argument("--port", type=int, default=8600, help="Port to listen on")
++    parser.add_argument("--directory", required=True, help="Directory to serve")
++    args = parser.parse_args()
++
++    handler = partial(HLSRequestHandler, directory=args.directory)
++    server = ThreadingHTTPServer((args.bind, args.port), handler)
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
++
++
++if __name__ == "__main__":
++    main()

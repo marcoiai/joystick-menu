@@ -1,3 +1,3 @@
 #!/bin/bash
-export DYLD_LIBRARY_PATH=/usr/local/lib
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 ./joystick_menu

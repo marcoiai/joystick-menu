@@ -1,0 +1,16 @@
+macOS
+
+Recommended:
+Use `pkg-config` so GCC picks the correct SDL3 include and library paths for
+your system.
+
+gcc joystick_menu.c -o joystick_menu $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-mixer sdl3-ttf)
+
+Core SDL3 only:
+gcc keys.c -o keys $(pkg-config --cflags --libs sdl3)
+
+Live Cast Bridge:
+brew install ffmpeg
+Use the "Live Cast Bridge: OFF/ON" menu item in `joystick_menu`.
+When enabled, launching a ROM writes the current HLS URL to `live-stream/current-url.txt`.
+Use that URL from `always-player` or any other HLS-capable player.

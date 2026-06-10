@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <dirent.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -31,6 +33,7 @@ static int typing_in_input = 0;
 static int app_running = 1;
 
 static Uint64 last_input_time = 0;
+extern char **environ;
 
 typedef struct {
     const char *dir_name;
@@ -55,8 +58,11 @@ static const SystemEntry systems[] = {
 static int selected_system_index = 0;
 static int system_scroll_offset = 0;
 static int in_rom_menu = 0;
+static int live_stream_enabled = 0;
 
-static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 2;
+static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 3;
+static char launch_status_text[256] = "";
+static int launch_status_is_error = 0;
 
 typedef struct {
     char *display_name;
@@ -83,11 +89,27 @@ static int has_allowed_extension(const char *filename, const char *allowed_exts)
 static void render_text_centered(const char *text, float y, SDL_Color color);
 static void render_text(const char *text, float x, float y, SDL_Color color);
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
+static void draw_launch_status(int win_h);
 static int file_exists(const char *path);
 static void draw_interactive_input_field(void);
 static SDL_Texture *load_cover_for_rom(const char *rom_path);
 static void leave_rom_menu(void);
 static int run_process(const char *const argv[]);
+static int run_process_silent(const char *const argv[]);
+static void clear_launch_status(void);
+static void set_launch_status(int is_error, const char *fmt, ...);
+static void format_command(const char *const argv[], char *buffer, size_t buffer_size);
+static void build_mame_rompath(char *buffer, size_t buffer_size);
+static void close_open_joysticks(void);
+static int initialize_frontend_runtime(void);
+static void shutdown_frontend_runtime(void);
+static int live_stream_menu_index(void);
+static int cover_scraper_menu_index(void);
+static int exit_menu_index(void);
+static const char *live_stream_menu_label(void);
+static void toggle_live_stream_bridge(void);
+static int start_live_stream_bridge(void);
+static void stop_live_stream_bridge(void);
 static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size);
 static int extract_rom_id(const char *rom_path, char *rom_id, size_t rom_id_size);
 static const char *find_pcsx2_app_path(void);
@@ -98,6 +120,26 @@ static void handle_current_selection(void);
 
 static void handle_joystick_input(const SDL_Event *event);
 static void handle_keyboard_input(const SDL_Event *event);
+
+static int live_stream_menu_index(void) {
+    return (int)(sizeof(systems) / sizeof(SystemEntry));
+}
+
+static int cover_scraper_menu_index(void) {
+    return live_stream_menu_index() + 1;
+}
+
+static int exit_menu_index(void) {
+    return cover_scraper_menu_index() + 1;
+}
+
+static const char *live_stream_menu_label(void) {
+#ifdef __APPLE__
+    return live_stream_enabled ? "Live Cast Bridge: ON (select to stop)" : "Live Cast Bridge: OFF (select to start)";
+#else
+    return "Live Cast Bridge: macOS only";
+#endif
+}
 
 static void draw_system_menu(void) {
     int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h);
@@ -123,9 +165,11 @@ static void draw_system_menu(void) {
         if (i == selected_system_index) color.r = color.g = 255;
 
         const char *label = NULL;
-        if (i < (item_count - 2)) {
+        if (i < live_stream_menu_index()) {
             label = systems[i].display_name;
-        } else if (i == (item_count - 2)) {
+        } else if (i == live_stream_menu_index()) {
+            label = live_stream_menu_label();
+        } else if (i == cover_scraper_menu_index()) {
             label = "Run Cover Scraper";
         } else {
             label = "Exit";
@@ -134,6 +178,7 @@ static void draw_system_menu(void) {
     }
 
     draw_scrollbar(item_count, visible_lines, system_scroll_offset, start_y, line_height, win_w);
+    draw_launch_status(win_h);
 }
 
 static void draw_rom_menu(void) {
@@ -194,6 +239,7 @@ static void draw_rom_menu(void) {
     }
 
     draw_interactive_input_field(); // Draw input field regardless of ROMs found
+    draw_launch_status(win_h);
 }
 
 static void draw_interactive_input_field(void) {
@@ -235,15 +281,89 @@ static void leave_rom_menu(void) {
     input_text[0] = '\0';
 }
 
-static int run_process(const char *const argv[]) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        execvp(argv[0], (char *const *)argv);
-        perror("Failed to execute process");
-        _exit(127);
+static void clear_launch_status(void) {
+    launch_status_text[0] = '\0';
+    launch_status_is_error = 0;
+}
+
+static void set_launch_status(int is_error, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(launch_status_text, sizeof(launch_status_text), fmt, args);
+    va_end(args);
+    launch_status_is_error = is_error;
+}
+
+static void format_command(const char *const argv[], char *buffer, size_t buffer_size) {
+    size_t used = 0;
+    if (!buffer || buffer_size == 0) {
+        return;
     }
-    if (pid < 0) {
-        perror("Failed to fork");
+
+    buffer[0] = '\0';
+    for (int i = 0; argv && argv[i]; ++i) {
+        int written = snprintf(buffer + used, buffer_size - used, "%s%s", i == 0 ? "" : " ", argv[i]);
+        if (written < 0) {
+            break;
+        }
+        if ((size_t)written >= buffer_size - used) {
+            used = buffer_size - 1;
+            break;
+        }
+        used += (size_t)written;
+    }
+}
+
+static void build_mame_rompath(char *buffer, size_t buffer_size) {
+    const char *candidates[] = { "roms", "bios", NULL, NULL };
+    char resolved[4096];
+    size_t used = 0;
+
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+
+    const char *home = getenv("HOME");
+    char home_mame_roms[4096];
+    if (home && home[0] != '\0') {
+        snprintf(home_mame_roms, sizeof(home_mame_roms), "%s/mame/roms", home);
+        candidates[2] = home_mame_roms;
+    }
+
+    buffer[0] = '\0';
+    for (int i = 0; candidates[i]; ++i) {
+        const char *path = candidates[i];
+        const char *final_path = path;
+
+        if (!file_exists(path)) {
+            continue;
+        }
+
+        if (realpath(path, resolved)) {
+            final_path = resolved;
+        }
+
+        int written = snprintf(buffer + used, buffer_size - used, "%s%s",
+            used == 0 ? "" : ";", final_path);
+        if (written < 0) {
+            break;
+        }
+        if ((size_t)written >= buffer_size - used) {
+            buffer[buffer_size - 1] = '\0';
+            break;
+        }
+        used += (size_t)written;
+    }
+}
+
+static int run_process_internal(const char *const argv[], int log_success) {
+    char command[2048];
+    format_command(argv, command, sizeof(command));
+
+    pid_t pid = 0;
+    int spawn_result = posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ);
+    if (spawn_result != 0) {
+        SDL_Log("Failed to launch process (%d): %s", spawn_result, command);
         return 0;
     }
 
@@ -253,12 +373,174 @@ static int run_process(const char *const argv[]) {
         return 0;
     }
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        SDL_Log("Process returned non-zero status for command: %s", argv[0]);
+    if (!WIFEXITED(status)) {
+        if (WIFSIGNALED(status)) {
+            SDL_Log("Process was terminated by signal %d: %s", WTERMSIG(status), command);
+        } else {
+            SDL_Log("Process ended unexpectedly: %s", command);
+        }
         return 0;
     }
 
+    if (WEXITSTATUS(status) != 0) {
+        SDL_Log("Process exited with status %d for command: %s", WEXITSTATUS(status), command);
+        return 0;
+    }
+
+    if (log_success) {
+        SDL_Log("Process finished successfully: %s", command);
+    }
     return 1;
+}
+
+static int run_process(const char *const argv[]) {
+    return run_process_internal(argv, 1);
+}
+
+static int run_process_silent(const char *const argv[]) {
+    return run_process_internal(argv, 0);
+}
+
+static void close_open_joysticks(void) {
+    int joystick_count = 0;
+    SDL_JoystickID *joystick_ids = SDL_GetJoysticks(&joystick_count);
+
+    if (!joystick_ids) {
+        return;
+    }
+
+    for (int i = 0; i < joystick_count; ++i) {
+        SDL_Joystick *joystick = SDL_GetJoystickFromID(joystick_ids[i]);
+        if (joystick) {
+            SDL_CloseJoystick(joystick);
+        }
+    }
+
+    SDL_free(joystick_ids);
+}
+
+static int initialize_frontend_runtime(void) {
+    if (!window || !renderer) {
+        if (!SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer)) {
+            SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
+            return 0;
+        }
+    }
+
+    if (!font) {
+        font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
+        if (!font) {
+            SDL_Log("TTF_OpenFont failed: %s", SDL_GetError());
+            return 0;
+        }
+    }
+
+    if (!logo_texture) {
+        logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
+    }
+
+    if (!background_texture) {
+        background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
+        if (background_texture) {
+            SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureAlphaMod(background_texture, 80);
+        }
+    }
+
+    if (!(Mix_Init(MIX_INIT_OGG) & MIX_INIT_OGG)) {
+        SDL_Log("Mix_Init did not initialize OGG support: %s", SDL_GetError());
+    }
+
+    SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
+    if (!Mix_OpenAudio(0, &desired_spec)) {
+        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
+    }
+
+    if (!music) {
+        music = Mix_LoadMUS("assets/background1.ogg");
+    }
+
+    if (music && !Mix_PlayingMusic()) {
+        Mix_VolumeMusic(64);
+        Mix_PlayMusic(music, -1);
+    }
+
+    return 1;
+}
+
+static void shutdown_frontend_runtime(void) {
+    typing_in_input = 0;
+    if (window) {
+        SDL_StopTextInput(window);
+    }
+
+    close_open_joysticks();
+
+    if (music) {
+        Mix_HaltMusic();
+        Mix_FreeMusic(music);
+        music = NULL;
+    }
+    Mix_CloseAudio();
+    Mix_Quit();
+
+    if (cover_texture) {
+        SDL_DestroyTexture(cover_texture);
+        cover_texture = NULL;
+    }
+    if (logo_texture) {
+        SDL_DestroyTexture(logo_texture);
+        logo_texture = NULL;
+    }
+    if (background_texture) {
+        SDL_DestroyTexture(background_texture);
+        background_texture = NULL;
+    }
+    if (font) {
+        TTF_CloseFont(font);
+        font = NULL;
+    }
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+        renderer = NULL;
+    }
+    if (window) {
+        SDL_DestroyWindow(window);
+        window = NULL;
+    }
+}
+
+static int start_live_stream_bridge(void) {
+#ifdef __APPLE__
+    const char *const argv[] = { "./scripts/live-stream/start-macos.sh", NULL };
+    return run_process_silent(argv);
+#else
+    return 0;
+#endif
+}
+
+static void stop_live_stream_bridge(void) {
+#ifdef __APPLE__
+    const char *const argv[] = { "./scripts/live-stream/stop-macos.sh", "--quiet", NULL };
+    if (!run_process_silent(argv)) {
+        SDL_Log("Live Cast Bridge stop script reported a problem.");
+    }
+#endif
+}
+
+static void toggle_live_stream_bridge(void) {
+#ifdef __APPLE__
+    live_stream_enabled = !live_stream_enabled;
+    if (!live_stream_enabled) {
+        stop_live_stream_bridge();
+        set_launch_status(0, "Live Cast disabled.");
+        return;
+    }
+
+    set_launch_status(0, "Live Cast armed. Launch a ROM to stream, or select again to stop.");
+#else
+    set_launch_status(1, "Live Cast Bridge currently needs macOS, ffmpeg, and python3.");
+#endif
 }
 
 static int resolve_launch_rom_path(const SystemEntry *sys, const char *rom_path, char *final_rom_path, size_t final_size) {
@@ -393,26 +675,50 @@ static void launch_selected_rom(void) {
     const SystemEntry *sys = &systems[selected_system_index];
     const char *rom_path = rom_list[selected_rom_index].rom_path;
     char final_rom_path[1024] = "";
+    int launched = 0;
+    int previous_music_volume = Mix_VolumeMusic(-1);
+    int was_music_playing = Mix_PlayingMusic();
+    char mame_rompath[4096] = "";
+#ifdef __APPLE__
+    int live_stream_started = 0;
+    int live_stream_failed = 0;
+    int frontend_runtime_shutdown = 0;
+#endif
 
     if (!resolve_launch_rom_path(sys, rom_path, final_rom_path, sizeof(final_rom_path))) {
+        set_launch_status(1, "Launch failed: ROM file could not be resolved");
         return;
     }
     const char *launch_rom_path = resolve_absolute_path(final_rom_path);
+    build_mame_rompath(mame_rompath, sizeof(mame_rompath));
 
-    int previous_music_volume = Mix_VolumeMusic(-1);
-    int was_music_playing = Mix_PlayingMusic();
+#ifdef __APPLE__
+    if (live_stream_enabled) {
+        shutdown_frontend_runtime();
+        frontend_runtime_shutdown = 1;
+        live_stream_started = start_live_stream_bridge();
+        if (!live_stream_started) {
+            live_stream_failed = 1;
+            SDL_Log("Live Cast Bridge failed to start. Continuing with emulator launch.");
+        }
+    } else if (was_music_playing) {
+        Mix_VolumeMusic(0);
+    }
+#else
     if (was_music_playing) {
         Mix_VolumeMusic(0);
     }
+#endif
 
     if (strcmp(sys->mame_sys, "neogeo") == 0) {
         char rom_id[256];
         if (!extract_rom_id(final_rom_path, rom_id, sizeof(rom_id))) {
             SDL_Log("Failed to parse NeoGeo ROM id from path: %s", final_rom_path);
+            set_launch_status(1, "Launch failed: invalid Neo Geo ROM name");
         } else {
-            const char *const argv[] = { "mame", sys->mame_sys, rom_id, NULL };
-            SDL_Log("mame %s %s", sys->mame_sys, rom_id);
-            run_process(argv);
+            const char *const argv[] = { "mame", "-rompath", mame_rompath, sys->mame_sys, rom_id, NULL };
+            SDL_Log("mame -rompath %s %s %s", mame_rompath, sys->mame_sys, rom_id);
+            launched = run_process(argv);
         }
     } else if (strcmp(sys->mame_sys, "rpcs3") == 0) {
         char game_arg[1200];
@@ -426,7 +732,7 @@ static void launch_selected_rom(void) {
             game_arg,
             NULL
         };
-        run_process(argv);
+        launched = run_process(argv);
     } else if (strcmp(sys->mame_sys, "pcsx2") == 0) {
         const char *pcsx2_bin = find_pcsx2_binary_path();
         if (pcsx2_bin) {
@@ -440,7 +746,7 @@ static void launch_selected_rom(void) {
                 launch_rom_path,
                 NULL
             };
-            int launched = run_process(argv_nogui);
+            launched = run_process(argv_nogui);
             if (!launched) {
                 const char *const argv_gui[] = {
                     pcsx2_bin,
@@ -451,7 +757,7 @@ static void launch_selected_rom(void) {
                     launch_rom_path,
                     NULL
                 };
-                run_process(argv_gui);
+                launched = run_process(argv_gui);
             }
         } else {
             const char *const argv[] = {
@@ -467,17 +773,51 @@ static void launch_selected_rom(void) {
                 launch_rom_path,
                 NULL
             };
-            run_process(argv);
+            launched = run_process(argv);
         }
     } else {
-        const char *const argv[] = { "mame", sys->mame_sys, sys->launch_arg, launch_rom_path, NULL };
-        run_process(argv);
+        const char *const argv[] = { "mame", "-rompath", mame_rompath, sys->mame_sys, sys->launch_arg, launch_rom_path, NULL };
+        launched = run_process(argv);
     }
 
+    if (!launched && mame_rompath[0] != '\0'
+        && strcmp(sys->mame_sys, "rpcs3") != 0
+        && strcmp(sys->mame_sys, "pcsx2") != 0) {
+        set_launch_status(1, "Launch failed: check MAME output for missing ROM/BIOS files");
+    }
+
+#ifdef __APPLE__
+    if (live_stream_enabled) {
+        stop_live_stream_bridge();
+    }
+    if (frontend_runtime_shutdown) {
+        if (!initialize_frontend_runtime()) {
+            set_launch_status(1, "Launch failed: could not restore menu");
+            app_running = 0;
+            return;
+        }
+    } else if (was_music_playing) {
+        Mix_VolumeMusic(previous_music_volume >= 0 ? previous_music_volume : 64);
+    }
+    if (live_stream_enabled && !live_stream_started && launched) {
+        set_launch_status(1, "Live Cast Bridge did not start. Check live-stream/logs.");
+    }
+#else
     if (was_music_playing) {
         Mix_VolumeMusic(previous_music_volume >= 0 ? previous_music_volume : 64);
     }
-    leave_rom_menu();
+#endif
+
+    if (launched) {
+#ifdef __APPLE__
+        if (!live_stream_failed) {
+            clear_launch_status();
+        }
+#else
+        clear_launch_status();
+#endif
+        leave_rom_menu();
+    }
 }
 
 static void handle_current_selection(void) {
@@ -486,13 +826,17 @@ static void handle_current_selection(void) {
         return;
     }
 
-    int item_count = system_menu_count;
-    if (selected_system_index == item_count - 1) {
+    if (selected_system_index == exit_menu_index()) {
         app_running = 0;
         return;
     }
 
-    if (selected_system_index == item_count - 2) {
+    if (selected_system_index == live_stream_menu_index()) {
+        toggle_live_stream_bridge();
+        return;
+    }
+
+    if (selected_system_index == cover_scraper_menu_index()) {
         const char *const argv[] = { "./cover-scraper", NULL };
         run_process(argv);
         return;
@@ -500,12 +844,24 @@ static void handle_current_selection(void) {
 
     load_all_rom_list(&systems[selected_system_index]);
     filter_rom_list(input_text);
+    clear_launch_status();
     in_rom_menu = 1;
 }
 
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
+
+#ifdef __APPLE__
+    const char *preserve_live_stream = getenv("JOYSTICK_MENU_PRESERVE_LIVE_STREAM");
+    if (!(preserve_live_stream && preserve_live_stream[0] != '\0' && strcmp(preserve_live_stream, "0") != 0)) {
+        stop_live_stream_bridge();
+        live_stream_enabled = 0;
+    } else {
+        live_stream_enabled = 1;
+    }
+#endif
+    clear_launch_status();
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_AUDIO)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -518,38 +874,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (!SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer)) {
-        SDL_Log("SDL_CreateWindowAndRenderer failed: %s", SDL_GetError());
+    if (!initialize_frontend_runtime()) {
         TTF_Quit();
         SDL_Quit();
         return 1;
-    }
-    font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
-    if (!font) {
-        SDL_Log("TTF_OpenFont failed: %s", SDL_GetError());
-    }
-
-    logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
-    background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
-
-    if (background_texture) {
-        SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureAlphaMod(background_texture, 80);
-    }
-
-    if (!(Mix_Init(MIX_INIT_OGG) & MIX_INIT_OGG)) {
-        SDL_Log("Mix_Init did not initialize OGG support: %s", SDL_GetError());
-    }
-    SDL_AudioSpec desired_spec = { .freq = 44100, .format = SDL_AUDIO_F32, .channels = 2 };
-    if (!Mix_OpenAudio(0, &desired_spec)) {
-        SDL_Log("Mix_OpenAudio failed: %s", SDL_GetError());
-    }
-
-    music = Mix_LoadMUS("assets/background1.ogg");
-
-    if (music) {
-        Mix_VolumeMusic(64);
-        Mix_PlayMusic(music, -1);
     }
 
     SDL_Event event;
@@ -600,14 +928,12 @@ int main(int argc, char *argv[]) {
 
     free_all_rom_list(); // Free the master list
     free_rom_list(); // Free the filtered list (if anything is left)
-    TTF_CloseFont(font);
-    SDL_DestroyTexture(logo_texture);
-    SDL_DestroyTexture(background_texture);
-    SDL_DestroyTexture(cover_texture);
-
-    Mix_FreeMusic(music);
-    Mix_CloseAudio();
-    Mix_Quit();
+#ifdef __APPLE__
+    if (live_stream_enabled) {
+        stop_live_stream_bridge();
+    }
+#endif
+    shutdown_frontend_runtime();
     TTF_Quit();
     SDL_Quit();
 
@@ -673,6 +999,17 @@ static void render_text(const char *text, float x, float y, SDL_Color color) {
     SDL_FRect dst = { x, y, (float)text_w, (float)text_h };
     SDL_RenderTexture(renderer, texture, NULL, &dst);
     SDL_DestroyTexture(texture);
+}
+
+static void draw_launch_status(int win_h) {
+    if (launch_status_text[0] == '\0') {
+        return;
+    }
+
+    SDL_Color color = launch_status_is_error
+        ? (SDL_Color){255, 120, 120, 255}
+        : (SDL_Color){170, 220, 170, 255};
+    render_text_centered(launch_status_text, win_h - FONT_SIZE - 35, color);
 }
 
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w) {
