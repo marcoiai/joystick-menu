@@ -25,17 +25,13 @@ static TTF_Font *font = NULL;
 #define AXIS_DEADZONE 8000
 #define LOGO_HEIGHT 200
 #define FONT_SIZE 18
+#define MAX_INPUT_LENGTH 256
 
 static Uint64 last_input_time = 0;
+static char input_text[MAX_INPUT_LENGTH] = "";
+static int typing_in_input = 0;
 
-typedef struct {
-    const char *dir_name;
-    const char *display_name;
-    const char *mame_sys;
-    const char *launch_arg;
-    const char *allowed_exts;
-} SystemEntry;
-
+typedef struct { const char *dir_name; const char *display_name; const char *mame_sys; const char *launch_arg; const char *allowed_exts; } SystemEntry;
 static const SystemEntry systems[] = {
     { "sms1", "Master System", "sms1", "-cart", "sms,bin,zip" },
     { "genesis", "Mega Drive", "genesis", "-cart", "md,bin,zip" },
@@ -46,435 +42,89 @@ static const SystemEntry systems[] = {
     { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
 };
 
-static int selected_system_index = 0;
-static int system_scroll_offset = 0;
-static int in_rom_menu = 0;
+static int selected_system_index = 0, system_scroll_offset = 0, in_rom_menu = 0;
 static int system_menu_count = sizeof(systems) / sizeof(SystemEntry) + 2;
+typedef struct { char *display_name; char *rom_path; } RomEntry;
+static RomEntry *all_rom_list = NULL, *rom_list = NULL;
+static int all_rom_count = 0, rom_count = 0, selected_rom_index = 0, rom_scroll_offset = 0;
 
-typedef struct {
-    char *display_name;
-    char *rom_path;
-} RomEntry;
-
-static RomEntry *rom_list = NULL;
-static int rom_count = 0;
-static int selected_rom_index = 0;
-static int rom_scroll_offset = 0;
-
-static void draw_system_menu(void);
-static void draw_rom_menu(void);
-static void load_rom_list(const SystemEntry *sys);
-static void free_rom_list(void);
-static void handle_events(const SDL_Event *event);
-static void handle_joystick_input(const SDL_Event *event);
-static void move_selection(int direction);
-static void activate_selection(void);
+static void draw_system_menu(void); static void draw_rom_menu(void); static void draw_search_field(void);
+static void load_rom_list(const SystemEntry *sys); static void free_rom_list(void); static void free_all_rom_list(void); static void filter_rom_list(void);
+static void handle_events(const SDL_Event *event); static void handle_joystick_input(const SDL_Event *event);
+static void move_selection(int direction); static void activate_selection(void); static void leave_rom_menu(void);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
-static void render_text_centered(const char *text, float y, SDL_Color color);
-static void render_text(const char *text, float x, float y, SDL_Color color);
+static void render_text_centered(const char *text, float y, SDL_Color color); static void render_text(const char *text, float x, float y, SDL_Color color);
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
-static int file_exists(const char *path);
-static SDL_Texture *load_cover_for_rom(const char *rom_path);
+static int file_exists(const char *path); static SDL_Texture *load_cover_for_rom(const char *rom_path);
 
 static void draw_system_menu(void) {
-    int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h);
-    int item_count = system_menu_count;
-    int line_height = FONT_SIZE + 10;
-    int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
-    if (selected_system_index < system_scroll_offset) system_scroll_offset = selected_system_index;
-    if (selected_system_index >= system_scroll_offset + visible_lines) system_scroll_offset = selected_system_index - visible_lines + 1;
-    int start_y = LOGO_HEIGHT + 20;
-    for (int i = 0; i < item_count; ++i) {
-        if (i < system_scroll_offset) continue;
-        if (i >= system_scroll_offset + visible_lines) break;
-        SDL_Color color = { 200, 200, 200, 255 };
-        if (i == selected_system_index) color.r = color.g = 255;
-        const char *label = NULL;
-        if (i < (item_count - 2)) label = systems[i].display_name;
-        else if (i == (item_count - 2)) label = "Run Cover Scraper";
-        else label = "Exit";
-        render_text_centered(label, start_y + (i - system_scroll_offset) * line_height, color);
+    int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h); int line_height=FONT_SIZE+10, visible=(win_h-LOGO_HEIGHT-40)/line_height;
+    if(selected_system_index<system_scroll_offset) system_scroll_offset=selected_system_index;
+    if(selected_system_index>=system_scroll_offset+visible) system_scroll_offset=selected_system_index-visible+1;
+    int start_y=LOGO_HEIGHT+20;
+    for(int i=system_scroll_offset;i<system_menu_count && i<system_scroll_offset+visible;i++) {
+        SDL_Color c={200,200,200,255}; if(i==selected_system_index)c.r=c.g=255;
+        const char *label=i<system_menu_count-2?systems[i].display_name:(i==system_menu_count-2?"Run Cover Scraper":"Exit");
+        render_text_centered(label,start_y+(i-system_scroll_offset)*line_height,c);
     }
-    draw_scrollbar(item_count, visible_lines, system_scroll_offset, start_y, line_height, win_w);
+    draw_scrollbar(system_menu_count,visible,system_scroll_offset,start_y,line_height,win_w);
+}
+
+static void draw_search_field(void) {
+    int w,h; SDL_GetWindowSize(window,&w,&h); float y=h-FONT_SIZE-42;
+    SDL_FRect r={50.0f,y,w-100.0f,FONT_SIZE+10.0f};
+    SDL_SetRenderDrawColor(renderer,50,50,50,210); SDL_RenderFillRect(renderer,&r);
+    if(typing_in_input) SDL_SetRenderDrawColor(renderer,255,255,0,255); else SDL_SetRenderDrawColor(renderer,110,110,110,255);
+    SDL_RenderRect(renderer,&r);
+    char text[MAX_INPUT_LENGTH+32]; snprintf(text,sizeof(text),"Search [TAB]: %s%s",input_text,typing_in_input&&((SDL_GetTicks()/500)%2)?"|":"");
+    render_text(text,56.0f,y+5.0f,(SDL_Color){255,255,255,255});
 }
 
 static void draw_rom_menu(void) {
-    int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h);
-    int line_height = FONT_SIZE + 10;
-    int visible_lines = (win_h - LOGO_HEIGHT - 40) / line_height;
-    if (selected_rom_index < rom_scroll_offset) rom_scroll_offset = selected_rom_index;
-    if (selected_rom_index >= rom_scroll_offset + visible_lines) rom_scroll_offset = selected_rom_index - visible_lines + 1;
-    int start_y = LOGO_HEIGHT + 20;
-    for (int i = 0; i < rom_count; ++i) {
-        if (i < rom_scroll_offset) continue;
-        if (i >= rom_scroll_offset + visible_lines) break;
-        SDL_Color color = { 200, 200, 200, 255 };
-        if (i == selected_rom_index) color.r = color.g = 255;
-        render_text_centered(rom_list[i].display_name, start_y + (i - rom_scroll_offset) * line_height, color);
+    int win_w,win_h; SDL_GetWindowSize(window,&win_w,&win_h); int line_height=FONT_SIZE+10, visible=(win_h-LOGO_HEIGHT-80)/line_height;
+    if(selected_rom_index<rom_scroll_offset)rom_scroll_offset=selected_rom_index;
+    if(selected_rom_index>=rom_scroll_offset+visible)rom_scroll_offset=selected_rom_index-visible+1;
+    int start_y=LOGO_HEIGHT+20;
+    for(int i=rom_scroll_offset;i<rom_count&&i<rom_scroll_offset+visible;i++) { SDL_Color c={200,200,200,255}; if(i==selected_rom_index)c.r=c.g=255; render_text_centered(rom_list[i].display_name,start_y+(i-rom_scroll_offset)*line_height,c); }
+    draw_scrollbar(rom_count,visible,rom_scroll_offset,start_y,line_height,win_w);
+    if(rom_list&&rom_count>0&&selected_rom_index<rom_count&&rom_list[selected_rom_index].rom_path) {
+        if(cover_texture){SDL_DestroyTexture(cover_texture);cover_texture=NULL;} cover_texture=load_cover_for_rom(rom_list[selected_rom_index].rom_path);
+        if(!cover_texture)cover_texture=IMG_LoadTexture(renderer,"assets/cover.png");
+        if(cover_texture){SDL_FRect dst={win_w-230.0f,30.0f,220.0f,220.0f};SDL_RenderTexture(renderer,cover_texture,NULL,&dst);}
     }
-    draw_scrollbar(rom_count, visible_lines, rom_scroll_offset, start_y, line_height, win_w);
-    if (rom_list && rom_list[selected_rom_index].rom_path) {
-        if (cover_texture) { SDL_DestroyTexture(cover_texture); cover_texture = NULL; }
-        cover_texture = load_cover_for_rom(rom_list[selected_rom_index].rom_path);
-        if (!cover_texture) cover_texture = IMG_LoadTexture(renderer, "assets/cover.png");
-        if (cover_texture) {
-            SDL_FRect dst = { win_w - 80 - 150.0f, 30 + 0.0f, 220.0f, 220.0f };
-            SDL_RenderTexture(renderer, cover_texture, NULL, &dst);
-        }
-    }
+    draw_search_field();
 }
 
-int main(int argc, char *argv[]) {
-    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_AUDIO);
-    TTF_Init();
-    SDL_CreateWindowAndRenderer("Joystick Menu", 1024, 768, 0, &window, &renderer);
-    font = TTF_OpenFont("assets/Roboto-Regular.ttf", FONT_SIZE);
-    logo_texture = IMG_LoadTexture(renderer, "assets/logo.png");
-    background_texture = IMG_LoadTexture(renderer, "assets/background.jpg");
-    if (background_texture) {
-        SDL_SetTextureBlendMode(background_texture, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureAlphaMod(background_texture, 80);
-    }
-
-    if (!MIX_Init()) {
-        SDL_Log("MIX_Init failed: %s", SDL_GetError());
-    } else {
-        mixer = MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
-        if (!mixer) {
-            SDL_Log("MIX_CreateMixerDevice failed: %s", SDL_GetError());
-        } else {
-            music = MIX_LoadAudio(mixer, "assets/background1.ogg", false);
-            if (!music) {
-                SDL_Log("MIX_LoadAudio failed: %s", SDL_GetError());
-            } else {
-                music_track = MIX_CreateTrack(mixer);
-                if (!music_track) {
-                    SDL_Log("MIX_CreateTrack failed: %s", SDL_GetError());
-                } else if (!MIX_SetTrackAudio(music_track, music)) {
-                    SDL_Log("MIX_SetTrackAudio failed: %s", SDL_GetError());
-                } else {
-                    MIX_SetTrackGain(music_track, 0.5f);
-                    SDL_PropertiesID props = SDL_CreateProperties();
-                    SDL_SetNumberProperty(props, MIX_PROP_PLAY_LOOPS_NUMBER, -1);
-                    if (!MIX_PlayTrack(music_track, props)) SDL_Log("MIX_PlayTrack failed: %s", SDL_GetError());
-                    SDL_DestroyProperties(props);
-                }
-            }
-        }
-    }
-
-    SDL_Event event;
-    int running = 1;
-    while (running) {
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT) running = 0;
-            if (event.type == SDL_EVENT_JOYSTICK_ADDED) {
-                SDL_Log("Joystick found.");
-                SDL_OpenJoystick(event.jdevice.which);
-            }
-            if (event.type == SDL_EVENT_JOYSTICK_REMOVED) {
-                SDL_Log("Joystick removed.");
-                SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));
-            }
-            handle_events(&event);
-            handle_joystick_input(&event);
-        }
-        int win_w, win_h;
-        SDL_GetWindowSize(window, &win_w, &win_h);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-        if (background_texture) {
-            SDL_FRect dst = { 0, 0, (float)win_w, (float)win_h };
-            SDL_RenderTexture(renderer, background_texture, NULL, &dst);
-        }
-        if (logo_texture) {
-            SDL_FRect dst = { (win_w - 200) / 2.0f, 40.0f, 200.0f, 100.0f };
-            SDL_RenderTexture(renderer, logo_texture, NULL, &dst);
-        }
-        if (in_rom_menu) draw_rom_menu(); else draw_system_menu();
-        SDL_Color sig_color = { 150, 150, 150, 255 };
-        render_text("by MARCO AURELIO SIMAO", 10, win_h - FONT_SIZE - 10, sig_color);
-        SDL_RenderPresent(renderer);
-        SDL_Delay(16);
-    }
-
-    free_rom_list();
-    TTF_CloseFont(font);
-    SDL_DestroyTexture(logo_texture);
-    SDL_DestroyTexture(background_texture);
-    if (cover_texture) { SDL_DestroyTexture(cover_texture); cover_texture = NULL; }
-    if (music_track) MIX_DestroyTrack(music_track);
-    if (music) MIX_DestroyAudio(music);
-    if (mixer) MIX_DestroyMixer(mixer);
-    MIX_Quit();
-    TTF_Quit();
-    SDL_Quit();
-    return 0;
+int main(int argc,char *argv[]) {
+    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_JOYSTICK|SDL_INIT_AUDIO); TTF_Init(); SDL_CreateWindowAndRenderer("Joystick Menu",1024,768,0,&window,&renderer);
+    font=TTF_OpenFont("assets/Roboto-Regular.ttf",FONT_SIZE); logo_texture=IMG_LoadTexture(renderer,"assets/logo.png"); background_texture=IMG_LoadTexture(renderer,"assets/background.jpg");
+    if(background_texture){SDL_SetTextureBlendMode(background_texture,SDL_BLENDMODE_BLEND);SDL_SetTextureAlphaMod(background_texture,80);}
+    if(MIX_Init()) { mixer=MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,NULL); if(mixer){ music=MIX_LoadAudio(mixer,"assets/background1.ogg",false); if(music){ music_track=MIX_CreateTrack(mixer); if(music_track&&MIX_SetTrackAudio(music_track,music)){MIX_SetTrackGain(music_track,0.5f);SDL_PropertiesID p=SDL_CreateProperties();SDL_SetNumberProperty(p,MIX_PROP_PLAY_LOOPS_NUMBER,-1);MIX_PlayTrack(music_track,p);SDL_DestroyProperties(p);}}}}
+    SDL_Event event; int running=1;
+    while(running){while(SDL_PollEvent(&event)){if(event.type==SDL_EVENT_QUIT)running=0;if(event.type==SDL_EVENT_JOYSTICK_ADDED)SDL_OpenJoystick(event.jdevice.which);if(event.type==SDL_EVENT_JOYSTICK_REMOVED)SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));handle_events(&event);handle_joystick_input(&event);}int w,h;SDL_GetWindowSize(window,&w,&h);SDL_SetRenderDrawColor(renderer,0,0,0,255);SDL_RenderClear(renderer);if(background_texture){SDL_FRect d={0,0,(float)w,(float)h};SDL_RenderTexture(renderer,background_texture,NULL,&d);}if(logo_texture){SDL_FRect d={(w-200)/2.0f,40,200,100};SDL_RenderTexture(renderer,logo_texture,NULL,&d);}if(in_rom_menu)draw_rom_menu();else draw_system_menu();render_text("by MARCO AURELIO SIMAO",10,h-FONT_SIZE-10,(SDL_Color){150,150,150,255});SDL_RenderPresent(renderer);SDL_Delay(16);}
+    free_rom_list();free_all_rom_list();TTF_CloseFont(font);SDL_DestroyTexture(logo_texture);SDL_DestroyTexture(background_texture);if(cover_texture)SDL_DestroyTexture(cover_texture);if(music_track)MIX_DestroyTrack(music_track);if(music)MIX_DestroyAudio(music);if(mixer)MIX_DestroyMixer(mixer);MIX_Quit();TTF_Quit();SDL_Quit();return 0;
 }
 
-static void render_text_centered(const char *text, float y, SDL_Color color) {
-    SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
-    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-    int text_w = surface->w, text_h = surface->h;
-    SDL_DestroySurface(surface);
-    int win_w;
-    SDL_GetWindowSize(window, &win_w, NULL);
-    SDL_FRect dst = { (win_w - text_w) / 2.0f, y, (float)text_w, (float)text_h };
-    SDL_RenderTexture(renderer, texture, NULL, &dst);
-    SDL_DestroyTexture(texture);
-}
+static void render_text_centered(const char *text,float y,SDL_Color color){SDL_Surface*s=TTF_RenderText_Blended(font,text,SDL_strlen(text),color);if(!s)return;SDL_Texture*t=SDL_CreateTextureFromSurface(renderer,s);int tw=s->w,th=s->h;SDL_DestroySurface(s);if(!t)return;int w;SDL_GetWindowSize(window,&w,NULL);SDL_FRect d={(w-tw)/2.0f,y,(float)tw,(float)th};SDL_RenderTexture(renderer,t,NULL,&d);SDL_DestroyTexture(t);}
+static void render_text(const char *text,float x,float y,SDL_Color color){SDL_Surface*s=TTF_RenderText_Blended(font,text,SDL_strlen(text),color);if(!s)return;SDL_Texture*t=SDL_CreateTextureFromSurface(renderer,s);int tw=s->w,th=s->h;SDL_DestroySurface(s);if(!t)return;SDL_FRect d={x,y,(float)tw,(float)th};SDL_RenderTexture(renderer,t,NULL,&d);SDL_DestroyTexture(t);}
+static void draw_scrollbar(int n,int visible,int off,int y,int lh,int w){if(n<=visible||visible<=0)return;float sh=visible*lh,hh=sh*(visible/(float)n);if(hh<10)hh=10;float hy=y+(off/(float)(n-visible))*(sh-hh);SDL_FRect b={w-20.0f,(float)y,8,sh},h={w-20.0f,hy,8,hh};SDL_SetRenderDrawColor(renderer,80,80,80,200);SDL_RenderFillRect(renderer,&b);SDL_SetRenderDrawColor(renderer,200,200,200,255);SDL_RenderFillRect(renderer,&h);}
+static int has_allowed_extension(const char*f,const char*a){const char*d=strrchr(f,'.');if(!d||d==f)return 0;char ext[16],tmp[64];SDL_strlcpy(ext,d+1,sizeof(ext));SDL_strlcpy(tmp,a,sizeof(tmp));for(char*t=strtok(tmp,",");t;t=strtok(NULL,","))if(SDL_strcasecmp(ext,t)==0)return 1;return 0;}
 
-static void render_text(const char *text, float x, float y, SDL_Color color) {
-    SDL_Surface *surface = TTF_RenderText_Blended(font, text, SDL_strlen(text), color);
-    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-    int text_w = surface->w, text_h = surface->h;
-    SDL_DestroySurface(surface);
-    SDL_FRect dst = { x, y, (float)text_w, (float)text_h };
-    SDL_RenderTexture(renderer, texture, NULL, &dst);
-    SDL_DestroyTexture(texture);
-}
+static void load_rom_list(const SystemEntry *sys){free_rom_list();free_all_rom_list();char path[512];snprintf(path,sizeof(path),"./roms/%s/",sys->dir_name);DIR*dir=opendir(path);if(!dir)return;int cap=20;all_rom_list=calloc(cap,sizeof(RomEntry));struct dirent*e;
+    while((e=readdir(dir))){if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;char fp[1024];snprintf(fp,sizeof(fp),"./roms/%s/%s",sys->dir_name,e->d_name);struct stat st;if(stat(fp,&st))continue;if(S_ISREG(st.st_mode)&&has_allowed_extension(e->d_name,sys->allowed_exts)){if(all_rom_count>=cap){cap*=2;all_rom_list=realloc(all_rom_list,cap*sizeof(RomEntry));}all_rom_list[all_rom_count].display_name=strdup(e->d_name);all_rom_list[all_rom_count++].rom_path=strdup(fp);}}
+    rewinddir(dir);while((e=readdir(dir))){if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;char sp[1024];snprintf(sp,sizeof(sp),"./roms/%s/%s",sys->dir_name,e->d_name);struct stat st;if(stat(sp,&st)||!S_ISDIR(st.st_mode))continue;DIR*sd=opendir(sp);if(!sd)continue;struct dirent*se;while((se=readdir(sd)))if(se->d_type==DT_REG&&has_allowed_extension(se->d_name,sys->allowed_exts)){if(all_rom_count>=cap){cap*=2;all_rom_list=realloc(all_rom_list,cap*sizeof(RomEntry));}char fp[1024];snprintf(fp,sizeof(fp),"%s/%s",sp,se->d_name);all_rom_list[all_rom_count].display_name=strdup(se->d_name);all_rom_list[all_rom_count++].rom_path=strdup(fp);}closedir(sd);}closedir(dir);filter_rom_list();}
+static void free_all_rom_list(void){if(all_rom_list){for(int i=0;i<all_rom_count;i++){SDL_free(all_rom_list[i].display_name);SDL_free(all_rom_list[i].rom_path);}SDL_free(all_rom_list);}all_rom_list=NULL;all_rom_count=0;}
+static void free_rom_list(void){SDL_free(rom_list);rom_list=NULL;rom_count=0;if(cover_texture){SDL_DestroyTexture(cover_texture);cover_texture=NULL;}}
+static void filter_rom_list(void){free_rom_list();rom_list=calloc(all_rom_count+1,sizeof(RomEntry));if(!rom_list)return;for(int i=0;i<all_rom_count;i++)if(!input_text[0]||SDL_strcasestr(all_rom_list[i].display_name,input_text)){rom_list[rom_count++]=all_rom_list[i];}rom_list[rom_count].display_name="Exit";rom_list[rom_count].rom_path=NULL;rom_count++;selected_rom_index=0;rom_scroll_offset=0;}
+static void leave_rom_menu(void){typing_in_input=0;SDL_StopTextInput(window);input_text[0]='\0';in_rom_menu=0;free_rom_list();free_all_rom_list();}
+static void move_selection(int d){if(typing_in_input)return;if(in_rom_menu){if(rom_count>0)selected_rom_index=(selected_rom_index+rom_count+d)%rom_count;}else selected_system_index=(selected_system_index+system_menu_count+d)%system_menu_count;}
 
-static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w) {
-    if (item_count <= visible_lines) return;
-    float scrollbar_height = visible_lines * line_height;
-    float handle_height = scrollbar_height * (visible_lines / (float)item_count);
-    float handle_y = start_y + (scroll_offset / (float)item_count) * scrollbar_height;
-    SDL_FRect bar = { win_w - 20.0f, (float)start_y, 8.0f, scrollbar_height };
-    SDL_FRect handle = { win_w - 20.0f, handle_y, 8.0f, handle_height };
-    SDL_SetRenderDrawColor(renderer, 80, 80, 80, 200);
-    SDL_RenderFillRect(renderer, &bar);
-    SDL_SetRenderDrawColor(renderer, 200, 200, 200, 255);
-    SDL_RenderFillRect(renderer, &handle);
-}
+static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
 
-static int has_allowed_extension(const char *filename, const char *allowed_exts) {
-    const char *dot = strrchr(filename, '.');
-    if (!dot || dot == filename) return 0;
-    char ext[16]; SDL_strlcpy(ext, dot + 1, sizeof(ext));
-    char temp[64]; SDL_strlcpy(temp, allowed_exts, sizeof(temp));
-    char *token = strtok(temp, ",");
-    while (token) {
-        if (SDL_strcasecmp(ext, token) == 0) return 1;
-        token = strtok(NULL, ",");
-    }
-    return 0;
-}
-
-static void load_rom_list(const SystemEntry *sys) {
-    free_rom_list();
-    char path[512];
-    snprintf(path, sizeof(path), "./roms/%s/", sys->dir_name);
-    DIR *dir = opendir(path);
-    if (!dir) return;
-    int capacity = 20;
-    rom_list = calloc(capacity, sizeof(RomEntry));
-    rom_count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        char full_path[512];
-        snprintf(full_path, sizeof(full_path), "./roms/%s/%s", sys->dir_name, entry->d_name);
-        struct stat st;
-        if (stat(full_path, &st) == -1) continue;
-        if (S_ISREG(st.st_mode) && has_allowed_extension(entry->d_name, sys->allowed_exts)) {
-            if (rom_count >= capacity) { capacity *= 2; rom_list = realloc(rom_list, capacity * sizeof(RomEntry)); }
-            rom_list[rom_count].display_name = strdup(entry->d_name);
-            rom_list[rom_count].rom_path = strdup(full_path);
-            rom_count++;
-        }
-    }
-    rewinddir(dir);
-    while ((entry = readdir(dir))) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        char sub_path[512];
-        snprintf(sub_path, sizeof(sub_path), "./roms/%s/%s", sys->dir_name, entry->d_name);
-        struct stat st;
-        if (stat(sub_path, &st) == -1) continue;
-        if (S_ISDIR(st.st_mode)) {
-            DIR *subdir = opendir(sub_path);
-            if (!subdir) continue;
-            struct dirent *sub_entry;
-            while ((sub_entry = readdir(subdir))) {
-                if (sub_entry->d_type == DT_REG && has_allowed_extension(sub_entry->d_name, sys->allowed_exts)) {
-                    if (rom_count >= capacity) { capacity *= 2; rom_list = realloc(rom_list, capacity * sizeof(RomEntry)); }
-                    rom_list[rom_count].display_name = strdup(sub_entry->d_name);
-                    char full_file_path[1024];
-                    snprintf(full_file_path, sizeof(full_file_path), "./roms/%s/%s/%s", sys->dir_name, entry->d_name, sub_entry->d_name);
-                    rom_list[rom_count].rom_path = strdup(full_file_path);
-                    rom_count++;
-                }
-            }
-            closedir(subdir);
-        }
-    }
-    closedir(dir);
-    rom_list = realloc(rom_list, (rom_count + 1) * sizeof(RomEntry));
-    rom_list[rom_count].display_name = strdup("Exit");
-    rom_list[rom_count].rom_path = NULL;
-    rom_count++;
-}
-
-static void free_rom_list(void) {
-    for (int i = 0; i < rom_count; ++i) {
-        SDL_free(rom_list[i].display_name);
-        SDL_free(rom_list[i].rom_path);
-    }
-    SDL_free(rom_list);
-    rom_list = NULL;
-    rom_count = 0;
-    if (cover_texture) { SDL_DestroyTexture(cover_texture); cover_texture = NULL; }
-}
-
-static void move_selection(int direction) {
-    if (in_rom_menu) {
-        if (rom_count > 0) selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
-    } else {
-        selected_system_index = (selected_system_index + system_menu_count + direction) % system_menu_count;
-    }
-}
-
-static void activate_selection(void) {
-    if (in_rom_menu) {
-        if (!rom_list || rom_count <= 0) return;
-        if (!rom_list[selected_rom_index].rom_path) {
-            in_rom_menu = 0;
-            free_rom_list();
-            return;
-        }
-
-        const SystemEntry *sys = &systems[selected_system_index];
-        const char *rom_path = rom_list[selected_rom_index].rom_path;
-        struct stat st;
-        if (stat(rom_path, &st) == -1) return;
-        char final_rom_path[512] = "";
-
-        if (S_ISDIR(st.st_mode)) {
-            DIR *d = opendir(rom_path);
-            struct dirent *ent;
-            if (d) {
-                while ((ent = readdir(d))) {
-                    if (ent->d_type == DT_REG && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
-                        snprintf(final_rom_path, sizeof(final_rom_path), "%s/%s", rom_path, ent->d_name);
-                        break;
-                    }
-                }
-                closedir(d);
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            snprintf(final_rom_path, sizeof(final_rom_path), "%s", rom_path);
-        }
-
-        if (final_rom_path[0] != '\0') {
-            char cmd[1024];
-            if (music_track) MIX_PauseTrack(music_track);
-            if (strcmp(sys->mame_sys, "neogeo") == 0) {
-                char romstrsize[256];
-                char *last_slash = strrchr(final_rom_path, '/');
-                char *romdot = strrchr(final_rom_path, '.');
-                if (last_slash && romdot && romdot > last_slash) {
-                    size_t len = (size_t)(romdot - (last_slash + 1));
-                    if (len >= sizeof(romstrsize)) len = sizeof(romstrsize) - 1;
-                    memcpy(romstrsize, last_slash + 1, len);
-                    romstrsize[len] = '\0';
-                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
-                    system(cmd);
-                }
-            } else {
-                snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
-                system(cmd);
-            }
-            if (music_track) MIX_ResumeTrack(music_track);
-        }
-        in_rom_menu = 0;
-        free_rom_list();
-        return;
-    }
-
-    if (selected_system_index == system_menu_count - 1) {
-        exit(0);
-    } else if (selected_system_index == system_menu_count - 2) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("./cover-scraper", "./cover-scraper", (char *)NULL);
-            perror("Failed to exec cover-scraper");
-            _exit(1);
-        } else if (pid > 0) {
-            int status;
-            waitpid(pid, &status, 0);
-        } else {
-            perror("Failed to fork");
-        }
-    } else {
-        load_rom_list(&systems[selected_system_index]);
-        in_rom_menu = 1;
-        selected_rom_index = 0;
-        rom_scroll_offset = 0;
-    }
-}
-
-static void handle_events(const SDL_Event *event) {
-    if (event->type != SDL_EVENT_KEY_DOWN || event->key.repeat) return;
-
-    switch (event->key.key) {
-        case SDLK_UP:
-            move_selection(-1);
-            break;
-        case SDLK_DOWN:
-            move_selection(1);
-            break;
-        case SDLK_RETURN:
-        case SDLK_KP_ENTER:
-        case SDLK_SPACE:
-            activate_selection();
-            break;
-        case SDLK_ESCAPE:
-            if (in_rom_menu) {
-                in_rom_menu = 0;
-                free_rom_list();
-            }
-            break;
-        default:
-            break;
-    }
-}
-
-static void handle_joystick_input(const SDL_Event *event) {
-    Uint64 now = SDL_GetTicks();
-    if (now < last_input_time + INPUT_COOLDOWN_MS) return;
-
-    if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
-        int direction = 0;
-        if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
-        else if (event->jaxis.value > AXIS_DEADZONE) direction = 1;
-        if (direction) {
-            move_selection(direction);
-            last_input_time = now;
-        }
-    }
-
-    if (event->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event->jbutton.button == 0) {
-        activate_selection();
-        last_input_time = now;
-    }
-}
-
-static int file_exists(const char *path) {
-    struct stat st;
-    return (stat(path, &st) == 0);
-}
-
-static SDL_Texture *load_cover_for_rom(const char *rom_path) {
-    if (!rom_path) return NULL;
-    const char *filename = strrchr(rom_path, '/');
-    filename = filename ? filename + 1 : rom_path;
-    const char *dot = strrchr(filename, '.');
-    int base_len = dot ? (int)(dot - filename) : (int)strlen(filename);
-    char cover_path[512];
-    SDL_Texture *tex = NULL;
-    snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.png", base_len, filename);
-    if (file_exists(cover_path)) { tex = IMG_LoadTexture(renderer, cover_path); if (tex) return tex; }
-    snprintf(cover_path, sizeof(cover_path), "./covers/%.*s.jpg", base_len, filename);
-    if (file_exists(cover_path)) { tex = IMG_LoadTexture(renderer, cover_path); if (tex) return tex; }
-    return NULL;
-}
+static void handle_events(const SDL_Event*e){if(e->type==SDL_EVENT_TEXT_INPUT&&typing_in_input){size_t left=MAX_INPUT_LENGTH-1-strlen(input_text);if(left){strncat(input_text,e->text.text,left);filter_rom_list();}return;}if(e->type!=SDL_EVENT_KEY_DOWN||e->key.repeat)return;
+    if(in_rom_menu&&e->key.key==SDLK_TAB){typing_in_input=!typing_in_input;if(typing_in_input)SDL_StartTextInput(window);else SDL_StopTextInput(window);return;}
+    if(typing_in_input){if(e->key.key==SDLK_BACKSPACE&&input_text[0]){size_t n=strlen(input_text);input_text[n-1]='\0';filter_rom_list();}else if(e->key.key==SDLK_RETURN||e->key.key==SDLK_KP_ENTER){typing_in_input=0;SDL_StopTextInput(window);}else if(e->key.key==SDLK_ESCAPE){typing_in_input=0;SDL_StopTextInput(window);input_text[0]='\0';filter_rom_list();}return;}
+    switch(e->key.key){case SDLK_UP:move_selection(-1);break;case SDLK_DOWN:move_selection(1);break;case SDLK_RETURN:case SDLK_KP_ENTER:case SDLK_SPACE:activate_selection();break;case SDLK_ESCAPE:if(in_rom_menu)leave_rom_menu();break;default:break;}}
+static void handle_joystick_input(const SDL_Event*e){if(typing_in_input)return;Uint64 now=SDL_GetTicks();if(now<last_input_time+INPUT_COOLDOWN_MS)return;if(e->type==SDL_EVENT_JOYSTICK_AXIS_MOTION&&e->jaxis.axis==1){int d=e->jaxis.value<-AXIS_DEADZONE?-1:(e->jaxis.value>AXIS_DEADZONE?1:0);if(d){move_selection(d);last_input_time=now;}}if(e->type==SDL_EVENT_JOYSTICK_BUTTON_DOWN&&e->jbutton.button==0){activate_selection();last_input_time=now;}}
+static int file_exists(const char*p){struct stat st;return stat(p,&st)==0;}
+static SDL_Texture*load_cover_for_rom(const char*rp){if(!rp)return NULL;const char*f=strrchr(rp,'/');f=f?f+1:rp;const char*d=strrchr(f,'.');int n=d?(int)(d-f):(int)strlen(f);char p[512];snprintf(p,sizeof(p),"./covers/%.*s.png",n,f);if(file_exists(p)){SDL_Texture*t=IMG_LoadTexture(renderer,p);if(t)return t;}snprintf(p,sizeof(p),"./covers/%.*s.jpg",n,f);return file_exists(p)?IMG_LoadTexture(renderer,p):NULL;}
