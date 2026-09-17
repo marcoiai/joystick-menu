@@ -67,6 +67,8 @@ static void load_rom_list(const SystemEntry *sys);
 static void free_rom_list(void);
 static void handle_events(const SDL_Event *event);
 static void handle_joystick_input(const SDL_Event *event);
+static void move_selection(int direction);
+static void activate_selection(void);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
 static void render_text_centered(const char *text, float y, SDL_Color color);
 static void render_text(const char *text, float x, float y, SDL_Color color);
@@ -154,9 +156,7 @@ int main(int argc, char *argv[]) {
                     MIX_SetTrackGain(music_track, 0.5f);
                     SDL_PropertiesID props = SDL_CreateProperties();
                     SDL_SetNumberProperty(props, MIX_PROP_PLAY_LOOPS_NUMBER, -1);
-                    if (!MIX_PlayTrack(music_track, props)) {
-                        SDL_Log("MIX_PlayTrack failed: %s", SDL_GetError());
-                    }
+                    if (!MIX_PlayTrack(music_track, props)) SDL_Log("MIX_PlayTrack failed: %s", SDL_GetError());
                     SDL_DestroyProperties(props);
                 }
             }
@@ -325,92 +325,136 @@ static void free_rom_list(void) {
     if (cover_texture) { SDL_DestroyTexture(cover_texture); cover_texture = NULL; }
 }
 
-static void handle_events(const SDL_Event *event) {
-    switch (event->type) {
-    case SDL_EVENT_KEY_DOWN:
-        if (event->key.key == SDLK_ESCAPE) {
-            printf("Escape key pressed! Quitting application.\n");
+static void move_selection(int direction) {
+    if (in_rom_menu) {
+        if (rom_count > 0) selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
+    } else {
+        selected_system_index = (selected_system_index + system_menu_count + direction) % system_menu_count;
+    }
+}
+
+static void activate_selection(void) {
+    if (in_rom_menu) {
+        if (!rom_list || rom_count <= 0) return;
+        if (!rom_list[selected_rom_index].rom_path) {
+            in_rom_menu = 0;
+            free_rom_list();
+            return;
         }
-        break;
-    default:
-        break;
+
+        const SystemEntry *sys = &systems[selected_system_index];
+        const char *rom_path = rom_list[selected_rom_index].rom_path;
+        struct stat st;
+        if (stat(rom_path, &st) == -1) return;
+        char final_rom_path[512] = "";
+
+        if (S_ISDIR(st.st_mode)) {
+            DIR *d = opendir(rom_path);
+            struct dirent *ent;
+            if (d) {
+                while ((ent = readdir(d))) {
+                    if (ent->d_type == DT_REG && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
+                        snprintf(final_rom_path, sizeof(final_rom_path), "%s/%s", rom_path, ent->d_name);
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            snprintf(final_rom_path, sizeof(final_rom_path), "%s", rom_path);
+        }
+
+        if (final_rom_path[0] != '\0') {
+            char cmd[1024];
+            if (music_track) MIX_PauseTrack(music_track);
+            if (strcmp(sys->mame_sys, "neogeo") == 0) {
+                char romstrsize[256];
+                char *last_slash = strrchr(final_rom_path, '/');
+                char *romdot = strrchr(final_rom_path, '.');
+                if (last_slash && romdot && romdot > last_slash) {
+                    size_t len = (size_t)(romdot - (last_slash + 1));
+                    if (len >= sizeof(romstrsize)) len = sizeof(romstrsize) - 1;
+                    memcpy(romstrsize, last_slash + 1, len);
+                    romstrsize[len] = '\0';
+                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
+                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
+                    system(cmd);
+                }
+            } else {
+                snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
+                system(cmd);
+            }
+            if (music_track) MIX_ResumeTrack(music_track);
+        }
+        in_rom_menu = 0;
+        free_rom_list();
+        return;
+    }
+
+    if (selected_system_index == system_menu_count - 1) {
+        exit(0);
+    } else if (selected_system_index == system_menu_count - 2) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("./cover-scraper", "./cover-scraper", (char *)NULL);
+            perror("Failed to exec cover-scraper");
+            _exit(1);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        } else {
+            perror("Failed to fork");
+        }
+    } else {
+        load_rom_list(&systems[selected_system_index]);
+        in_rom_menu = 1;
+        selected_rom_index = 0;
+        rom_scroll_offset = 0;
+    }
+}
+
+static void handle_events(const SDL_Event *event) {
+    if (event->type != SDL_EVENT_KEY_DOWN || event->key.repeat) return;
+
+    switch (event->key.key) {
+        case SDLK_UP:
+            move_selection(-1);
+            break;
+        case SDLK_DOWN:
+            move_selection(1);
+            break;
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+        case SDLK_SPACE:
+            activate_selection();
+            break;
+        case SDLK_ESCAPE:
+            if (in_rom_menu) {
+                in_rom_menu = 0;
+                free_rom_list();
+            }
+            break;
+        default:
+            break;
     }
 }
 
 static void handle_joystick_input(const SDL_Event *event) {
     Uint64 now = SDL_GetTicks();
     if (now < last_input_time + INPUT_COOLDOWN_MS) return;
+
     if (event->type == SDL_EVENT_JOYSTICK_AXIS_MOTION && event->jaxis.axis == 1) {
         int direction = 0;
         if (event->jaxis.value < -AXIS_DEADZONE) direction = -1;
         else if (event->jaxis.value > AXIS_DEADZONE) direction = 1;
         if (direction) {
-            if (in_rom_menu) selected_rom_index = (selected_rom_index + rom_count + direction) % rom_count;
-            else { int item_count = system_menu_count; selected_system_index = (selected_system_index + item_count + direction) % item_count; }
+            move_selection(direction);
             last_input_time = now;
         }
     }
+
     if (event->type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event->jbutton.button == 0) {
-        if (in_rom_menu) {
-            if (!rom_list[selected_rom_index].rom_path) { in_rom_menu = 0; free_rom_list(); return; }
-            const SystemEntry *sys = &systems[selected_system_index];
-            const char *rom_path = rom_list[selected_rom_index].rom_path;
-            struct stat st;
-            if (stat(rom_path, &st) == -1) return;
-            char final_rom_path[512] = "";
-            if (S_ISDIR(st.st_mode)) {
-                DIR *d = opendir(rom_path);
-                struct dirent *ent;
-                if (d) {
-                    while ((ent = readdir(d))) {
-                        if (ent->d_type == DT_REG && has_allowed_extension(ent->d_name, sys->allowed_exts)) {
-                            snprintf(final_rom_path, sizeof(final_rom_path), "%s/%s", rom_path, ent->d_name);
-                            break;
-                        }
-                    }
-                    closedir(d);
-                }
-            } else if (S_ISREG(st.st_mode)) snprintf(final_rom_path, sizeof(final_rom_path), "%s", rom_path);
-            if (final_rom_path[0] != '\0') {
-                char cmd[1024];
-                if (music_track) MIX_PauseTrack(music_track);
-                if (strcmp(sys->mame_sys, "neogeo") == 0) {
-                    char romstrsize[256];
-                    char *last_slash = strrchr(final_rom_path, '/');
-                    char *romdot = strrchr(final_rom_path, '.');
-                    strncpy(romstrsize, last_slash + 1, (romdot - (last_slash + 1)));
-                    romstrsize[(romdot - (last_slash + 1))] = '\0';
-                    SDL_Log("mame %s %s", sys->mame_sys, romstrsize);
-                    snprintf(cmd, sizeof(cmd), "mame %s %s", sys->mame_sys, romstrsize);
-                    system(cmd);
-                } else {
-                    snprintf(cmd, sizeof(cmd), "mame %s %s \"%s\"", sys->mame_sys, sys->launch_arg, final_rom_path);
-                    system(cmd);
-                }
-                if (music_track) MIX_ResumeTrack(music_track);
-            }
-            in_rom_menu = 0;
-            free_rom_list();
-        } else {
-            int item_count = system_menu_count;
-            if (selected_system_index == item_count - 1) {
-                exit(0);
-            } else if (selected_system_index == item_count - 2) {
-                pid_t pid = fork();
-                if (pid == 0) {
-                    execl("./cover-scraper", "./cover-scraper", (char *)NULL);
-                    perror("Failed to exec cover-scraper");
-                    _exit(1);
-                } else if (pid > 0) {
-                    int status; waitpid(pid, &status, 0);
-                } else perror("Failed to fork");
-            } else {
-                load_rom_list(&systems[selected_system_index]);
-                in_rom_menu = 1;
-                selected_rom_index = 0;
-                rom_scroll_offset = 0;
-            }
-        }
+        activate_selection();
         last_input_time = now;
     }
 }
