@@ -123,7 +123,7 @@ static void move_selection(int d){if(typing_in_input)return;if(in_rom_menu){if(r
 
 static int launch_pcsx2(const char *rom_path){
     const char *names[] = { "pcsx2-qt", "pcsx2", "PCSX2", "PCSX2-Qt", "PCSX2-qt", NULL };
-    char cmd[4096];
+    char cmd[8192];
 
     for(int i=0; names[i]; i++){
         snprintf(cmd,sizeof(cmd),"command -v %s >/dev/null 2>&1",names[i]);
@@ -133,36 +133,71 @@ static int launch_pcsx2(const char *rom_path){
         }
     }
 
-    const char *home = getenv("HOME");
-    if(home && home[0]){
-        char findcmd[4096];
-        snprintf(findcmd,sizeof(findcmd),
-            "find \"%s\" /opt /usr/local -type f "
-            "\\( -iname 'pcsx2*.AppImage' -o -iname 'PCSX2*.AppImage' \\) "
-            "-print -quit 2>/dev/null",
-            home);
+    const char *patterns[] = {
+        "./pcsx2*.AppImage",
+        "./PCSX2*.AppImage",
+        NULL
+    };
 
-        FILE *fp = popen(findcmd,"r");
-        if(fp){
-            char bin[4096];
-            if(fgets(bin,sizeof(bin),fp)){
-                size_t n=strlen(bin);
-                while(n>0 && (bin[n-1]=='\\n' || bin[n-1]=='\\r')) bin[--n]='\\0';
-                pclose(fp);
-
-                if(bin[0]){
-                    if(access(bin,X_OK)!=0) chmod(bin,0755);
-                    snprintf(cmd,sizeof(cmd),"\"%s\" -batch -fastboot -fullscreen -- \"%s\"",bin,rom_path);
-                    return system(cmd)==0;
-                }
-            }else{
-                pclose(fp);
-            }
+    for(int i=0; patterns[i]; i++){
+        glob_t g; memset(&g,0,sizeof(g));
+        if(glob(patterns[i],0,NULL,&g)==0 && g.gl_pathc>0){
+            const char *bin=g.gl_pathv[0];
+            if(access(bin,X_OK)!=0) chmod(bin,0755);
+            snprintf(cmd,sizeof(cmd),"\"%s\" -batch -fastboot -fullscreen -- \"%s\"",bin,rom_path);
+            int ok=system(cmd)==0;
+            globfree(&g);
+            return ok;
         }
+        globfree(&g);
     }
 
-    SDL_Log("PCSX2 executable not found.");
-    return 0;
+    SDL_Log("PCSX2 not found. Downloading official stable Linux AppImage...");
+
+    const char *url_cmd =
+        "curl -fsSL https://api.github.com/repos/PCSX2/pcsx2/releases/latest "
+        "| grep 'browser_download_url' "
+        "| grep -i 'linux.*appimage.*x64.*Qt\\|linux.*x64.*Qt.*AppImage' "
+        "| head -n1 "
+        "| sed -E 's/.*\"(https:[^\"]+)\".*/\\1/'";
+
+    FILE *fp = popen(url_cmd,"r");
+    if(!fp){
+        SDL_Log("Could not query PCSX2 release URL.");
+        return 0;
+    }
+
+    char url[4096] = "";
+    if(fgets(url,sizeof(url),fp)){
+        size_t n=strlen(url);
+        while(n>0 && (url[n-1]=='\\n' || url[n-1]=='\\r')) url[--n]='\\0';
+    }
+    pclose(fp);
+
+    if(!url[0]){
+        SDL_Log("Could not find an official PCSX2 Linux AppImage asset.");
+        return 0;
+    }
+
+    snprintf(cmd,sizeof(cmd),
+        "curl -fL --progress-bar \"%s\" -o ./PCSX2.AppImage",
+        url);
+
+    if(system(cmd)!=0){
+        SDL_Log("PCSX2 download failed.");
+        return 0;
+    }
+
+    if(chmod("./PCSX2.AppImage",0755)!=0){
+        SDL_Log("Could not make PCSX2.AppImage executable.");
+        return 0;
+    }
+
+    snprintf(cmd,sizeof(cmd),
+        "\"./PCSX2.AppImage\" -batch -fastboot -fullscreen -- \"%s\"",
+        rom_path);
+
+    return system(cmd)==0;
 }
 
 static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else{snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
