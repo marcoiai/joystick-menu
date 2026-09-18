@@ -122,8 +122,9 @@ static void leave_rom_menu(void){typing_in_input=0;SDL_StopTextInput(window);inp
 static void move_selection(int d){if(typing_in_input)return;if(in_rom_menu){if(rom_count>0)selected_rom_index=(selected_rom_index+rom_count+d)%rom_count;}else selected_system_index=(selected_system_index+system_menu_count+d)%system_menu_count;}
 
 static int launch_pcsx2(const char *rom_path){
-    const char *names[] = { "pcsx2-qt", "pcsx2", "PCSX2", NULL };
+    const char *names[] = { "pcsx2-qt", "pcsx2", "PCSX2", "PCSX2-Qt", "PCSX2-qt", NULL };
     char cmd[4096];
+
     for(int i=0; names[i]; i++){
         snprintf(cmd,sizeof(cmd),"command -v %s >/dev/null 2>&1",names[i]);
         if(system(cmd)==0){
@@ -131,18 +132,36 @@ static int launch_pcsx2(const char *rom_path){
             return system(cmd)==0;
         }
     }
-    const char *patterns[] = { "./pcsx2*.AppImage", "./PCSX2*.AppImage", NULL };
-    for(int i=0; patterns[i]; i++){
-        glob_t g; memset(&g,0,sizeof(g));
-        if(glob(patterns[i],0,NULL,&g)==0 && g.gl_pathc>0){
-            const char *bin=g.gl_pathv[0];
-            if(access(bin,X_OK)!=0) chmod(bin,0755);
-            snprintf(cmd,sizeof(cmd),"\"%s\" -batch -fastboot -fullscreen -- \"%s\"",bin,rom_path);
-            int ok=system(cmd)==0; globfree(&g); return ok;
+
+    const char *home = getenv("HOME");
+    if(home && home[0]){
+        char findcmd[4096];
+        snprintf(findcmd,sizeof(findcmd),
+            "find \"%s\" /opt /usr/local -type f "
+            "\\( -iname 'pcsx2*.AppImage' -o -iname 'PCSX2*.AppImage' \\) "
+            "-print -quit 2>/dev/null",
+            home);
+
+        FILE *fp = popen(findcmd,"r");
+        if(fp){
+            char bin[4096];
+            if(fgets(bin,sizeof(bin),fp)){
+                size_t n=strlen(bin);
+                while(n>0 && (bin[n-1]=='\\n' || bin[n-1]=='\\r')) bin[--n]='\\0';
+                pclose(fp);
+
+                if(bin[0]){
+                    if(access(bin,X_OK)!=0) chmod(bin,0755);
+                    snprintf(cmd,sizeof(cmd),"\"%s\" -batch -fastboot -fullscreen -- \"%s\"",bin,rom_path);
+                    return system(cmd)==0;
+                }
+            }else{
+                pclose(fp);
+            }
         }
-        globfree(&g);
     }
-    SDL_Log("PCSX2 executable not found in PATH or current directory.");
+
+    SDL_Log("PCSX2 executable not found.");
     return 0;
 }
 
