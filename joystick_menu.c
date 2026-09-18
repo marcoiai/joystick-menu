@@ -156,10 +156,8 @@ static int launch_pcsx2(const char *rom_path){
 
     const char *url_cmd =
         "curl -fsSL https://api.github.com/repos/PCSX2/pcsx2/releases/latest "
-        "| grep 'browser_download_url' "
-        "| grep -i 'linux.*appimage.*x64.*Qt\\|linux.*x64.*Qt.*AppImage' "
-        "| head -n1 "
-        "| sed -E 's/.*\"(https:[^\"]+)\".*/\\1/'";
+        "| grep -o 'https://[^\"]*linux-appimage-x64-Qt.AppImage' "
+        "| head -n1";
 
     FILE *fp = popen(url_cmd,"r");
     if(!fp){
@@ -170,7 +168,7 @@ static int launch_pcsx2(const char *rom_path){
     char url[4096] = "";
     if(fgets(url,sizeof(url),fp)){
         size_t n=strlen(url);
-        while(n>0 && (url[n-1]=='\\n' || url[n-1]=='\\r')) url[--n]='\\0';
+        while(n>0 && (url[n-1]=='\n' || url[n-1]=='\r')) url[--n]='\0';
     }
     pclose(fp);
 
