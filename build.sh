@@ -18,16 +18,16 @@ install_deps() {
 
   if command -v pacman >/dev/null 2>&1; then
     sudo pacman -S --needed --noconfirm \
-      base-devel pkgconf curl \
+      base-devel pkgconf curl mame \
       sdl3 sdl3_image sdl3_ttf sdl3_mixer
   elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y \
-      build-essential pkg-config curl \
+      build-essential pkg-config curl mame \
       libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev libsdl3-mixer-dev
   elif command -v dnf >/dev/null 2>&1; then
     sudo dnf install -y \
-      gcc gcc-c++ make pkgconf-pkg-config curl \
+      gcc gcc-c++ make pkgconf-pkg-config curl mame \
       SDL3-devel SDL3_image-devel SDL3_ttf-devel SDL3_mixer-devel
   else
     echo "Unsupported package manager."
