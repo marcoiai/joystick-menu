@@ -42,6 +42,7 @@ static const SystemEntry systems[] = {
     { "psu", "PlayStation 1", "psu", "-cdrom", "cue,chd,iso" },
     { "neogeo", "Neo Geo", "neogeo", NULL, "neo" },
     { "ps2", "PlayStation 2", "pcsx2", NULL, "iso,chd,cso" },
+    { "ps3", "PlayStation 3", "rpcs3", NULL, "iso,pkg" },
 };
 
 static int selected_system_index = 0, system_scroll_offset = 0, in_rom_menu = 0;
@@ -57,7 +58,7 @@ static void move_selection(int direction); static void activate_selection(void);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
 static void render_text_centered(const char *text, float y, SDL_Color color); static void render_text(const char *text, float x, float y, SDL_Color color);
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
-static int file_exists(const char *path); static SDL_Texture *load_cover_for_rom(const char *rom_path); static int launch_pcsx2(const char *rom_path);
+static int file_exists(const char *path); static SDL_Texture *load_cover_for_rom(const char *rom_path); static int launch_pcsx2(const char *rom_path); static int launch_rpcs3(const char *rom_path);
 
 static void draw_system_menu(void) {
     int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h); int line_height=FONT_SIZE+10, visible=(win_h-LOGO_HEIGHT-40)/line_height;
@@ -239,7 +240,115 @@ static int launch_pcsx2(const char *rom_path){
     return system(cmd)==0;
 }
 
-static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else{snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
+static int launch_rpcs3(const char *rom_path){
+    const char *names[] = { "rpcs3", "RPCS3", NULL };
+    char cmd[8192];
+
+    for(int i=0; names[i]; i++){
+        snprintf(cmd,sizeof(cmd),"command -v %s >/dev/null 2>&1",names[i]);
+        if(system(cmd)==0){
+            snprintf(cmd,sizeof(cmd),"%s --no-gui \"%s\"",names[i],rom_path);
+            return system(cmd)==0;
+        }
+    }
+
+    const char *patterns[] = {
+        "./rpcs3*.AppImage",
+        "./RPCS3*.AppImage",
+        NULL
+    };
+
+    for(int i=0; patterns[i]; i++){
+        glob_t g; memset(&g,0,sizeof(g));
+        if(glob(patterns[i],0,NULL,&g)==0 && g.gl_pathc>0){
+            const char *bin=g.gl_pathv[0];
+            if(access(bin,X_OK)!=0) chmod(bin,0755);
+            snprintf(cmd,sizeof(cmd),"\"%s\" --no-gui \"%s\"",bin,rom_path);
+            int ok=system(cmd)==0;
+            globfree(&g);
+            return ok;
+        }
+        globfree(&g);
+    }
+
+    SDL_Log("RPCS3 not found. Downloading latest Linux AppImage...");
+
+    const char *url_cmd =
+        "curl -fsSL https://api.github.com/repos/RPCS3/rpcs3-binaries-linux/releases/latest "
+        "| grep -o 'https://[^\"]*linux64.AppImage' "
+        "| head -n1";
+
+    FILE *fp = popen(url_cmd,"r");
+    if(!fp){
+        SDL_Log("Could not query RPCS3 release URL.");
+        return 0;
+    }
+
+    char url[4096] = "";
+    if(fgets(url,sizeof(url),fp)){
+        size_t n=strlen(url);
+        while(n>0 && (url[n-1]=='\n' || url[n-1]=='\r')) url[--n]='\0';
+    }
+    pclose(fp);
+
+    if(!url[0]){
+        SDL_Log("Could not find an RPCS3 Linux AppImage asset.");
+        return 0;
+    }
+
+    pid_t download_pid = fork();
+    if(download_pid == 0){
+        execlp("curl","curl","-fL","--progress-bar",url,"-o","./RPCS3.AppImage",(char*)NULL);
+        _exit(127);
+    }
+    if(download_pid < 0){
+        SDL_Log("Could not start RPCS3 download.");
+        return 0;
+    }
+
+    int download_status = 0;
+    while(1){
+        pid_t r = waitpid(download_pid,&download_status,WNOHANG);
+        if(r == download_pid) break;
+        if(r < 0){
+            SDL_Log("Error while waiting for RPCS3 download.");
+            return 0;
+        }
+
+        SDL_Event ev;
+        while(SDL_PollEvent(&ev)){ }
+
+        int w,h;
+        SDL_GetWindowSize(window,&w,&h);
+        SDL_SetRenderDrawColor(renderer,0,0,0,255);
+        SDL_RenderClear(renderer);
+
+        char loading[64];
+        int dots = (int)((SDL_GetTicks()/400)%4);
+        snprintf(loading,sizeof(loading),"Downloading RPCS3%.*s",dots,"...");
+
+        render_text_centered(loading,(float)h/2.0f-20.0f,(SDL_Color){255,255,255,255});
+        render_text_centered("First run only",(float)h/2.0f+15.0f,(SDL_Color){160,160,160,255});
+        SDL_RenderPresent(renderer);
+        SDL_Delay(50);
+    }
+
+    if(!WIFEXITED(download_status) || WEXITSTATUS(download_status)!=0){
+        SDL_Log("RPCS3 download failed.");
+        return 0;
+    }
+
+    if(chmod("./RPCS3.AppImage",0755)!=0){
+        SDL_Log("Could not make RPCS3.AppImage executable.");
+        return 0;
+    }
+
+    snprintf(cmd,sizeof(cmd),"\"./RPCS3.AppImage\" --no-gui \"%s\"",rom_path);
+    return system(cmd)==0;
+}
+
+
+static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else if(!strcmp(sys->mame_sys,"rpcs3")){launch_rpcs3(final);}else{snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
 
 static void handle_events(const SDL_Event*e){if(e->type==SDL_EVENT_TEXT_INPUT&&typing_in_input){size_t left=MAX_INPUT_LENGTH-1-strlen(input_text);if(left){strncat(input_text,e->text.text,left);filter_rom_list();}return;}if(e->type!=SDL_EVENT_KEY_DOWN||e->key.repeat)return;
     if(in_rom_menu&&e->key.key==SDLK_TAB){typing_in_input=!typing_in_input;if(typing_in_input)SDL_StartTextInput(window);else SDL_StopTextInput(window);return;}
