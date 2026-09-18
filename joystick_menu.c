@@ -177,11 +177,52 @@ static int launch_pcsx2(const char *rom_path){
         return 0;
     }
 
-    snprintf(cmd,sizeof(cmd),
-        "curl -fL --progress-bar \"%s\" -o ./PCSX2.AppImage",
-        url);
+    pid_t download_pid = fork();
+    if(download_pid == 0){
+        execlp("curl","curl","-fL","--progress-bar",url,"-o","./PCSX2.AppImage",(char*)NULL);
+        _exit(127);
+    }
+    if(download_pid < 0){
+        SDL_Log("Could not start PCSX2 download.");
+        return 0;
+    }
 
-    if(system(cmd)!=0){
+    int download_status = 0;
+    int done = 0;
+    while(!done){
+        pid_t r = waitpid(download_pid,&download_status,WNOHANG);
+        if(r == download_pid){
+            done = 1;
+            break;
+        }
+        if(r < 0){
+            SDL_Log("Error while waiting for PCSX2 download.");
+            return 0;
+        }
+
+        SDL_Event ev;
+        while(SDL_PollEvent(&ev)){
+            if(ev.type == SDL_EVENT_QUIT){
+                SDL_Log("Download continues until process exits.");
+            }
+        }
+
+        int w,h;
+        SDL_GetWindowSize(window,&w,&h);
+        SDL_SetRenderDrawColor(renderer,0,0,0,255);
+        SDL_RenderClear(renderer);
+
+        char loading[64];
+        int dots = (int)((SDL_GetTicks()/400)%4);
+        snprintf(loading,sizeof(loading),"Downloading PCSX2%.*s",dots,"...");
+
+        render_text_centered(loading,(float)h/2.0f-20.0f,(SDL_Color){255,255,255,255});
+        render_text_centered("First run only",(float)h/2.0f+15.0f,(SDL_Color){160,160,160,255});
+        SDL_RenderPresent(renderer);
+        SDL_Delay(50);
+    }
+
+    if(!WIFEXITED(download_status) || WEXITSTATUS(download_status)!=0){
         SDL_Log("PCSX2 download failed.");
         return 0;
     }
