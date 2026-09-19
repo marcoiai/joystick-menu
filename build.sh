@@ -6,7 +6,8 @@ SDL_PKGS=(sdl3 sdl3-image sdl3-ttf sdl3-mixer)
 have_build_deps() {
   command -v gcc >/dev/null 2>&1 &&
   command -v pkg-config >/dev/null 2>&1 &&
-  command -v curl >/dev/null 2>&1 || return 1
+  command -v curl >/dev/null 2>&1 &&
+  command -v mame >/dev/null 2>&1 || return 1
 
   for pkg in "${SDL_PKGS[@]}"; do
     pkg-config --exists "$pkg" || return 1
@@ -31,7 +32,7 @@ install_deps() {
       SDL3-devel SDL3_image-devel SDL3_ttf-devel SDL3_mixer-devel
   else
     echo "Unsupported package manager."
-    echo "Install GCC, pkg-config, curl, SDL3, SDL3_image, SDL3_ttf and SDL3_mixer manually."
+    echo "Install GCC, pkg-config, curl, MAME, SDL3, SDL3_image, SDL3_ttf and SDL3_mixer manually."
     exit 1
   fi
 }
