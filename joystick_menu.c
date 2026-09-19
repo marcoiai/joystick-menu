@@ -58,7 +58,7 @@ static void move_selection(int direction); static void activate_selection(void);
 static int has_allowed_extension(const char *filename, const char *allowed_exts);
 static void render_text_centered(const char *text, float y, SDL_Color color); static void render_text(const char *text, float x, float y, SDL_Color color);
 static void draw_scrollbar(int item_count, int visible_lines, int scroll_offset, int start_y, int line_height, int win_w);
-static int file_exists(const char *path); static SDL_Texture *load_cover_for_rom(const char *rom_path); static int launch_pcsx2(const char *rom_path); static int launch_rpcs3(const char *rom_path);
+static int file_exists(const char *path); static SDL_Texture *load_cover_for_rom(const char *rom_path); static int ensure_mame(void); static int launch_pcsx2(const char *rom_path); static int launch_rpcs3(const char *rom_path);
 
 static void draw_system_menu(void) {
     int win_w, win_h; SDL_GetWindowSize(window, &win_w, &win_h); int line_height=FONT_SIZE+10, visible=(win_h-LOGO_HEIGHT-40)/line_height;
@@ -121,6 +121,82 @@ static void free_rom_list(void){SDL_free(rom_list);rom_list=NULL;rom_count=0;if(
 static void filter_rom_list(void){free_rom_list();rom_list=calloc(all_rom_count+1,sizeof(RomEntry));if(!rom_list)return;for(int i=0;i<all_rom_count;i++)if(!input_text[0]||SDL_strcasestr(all_rom_list[i].display_name,input_text)){rom_list[rom_count++]=all_rom_list[i];}rom_list[rom_count].display_name="Exit";rom_list[rom_count].rom_path=NULL;rom_count++;selected_rom_index=0;rom_scroll_offset=0;}
 static void leave_rom_menu(void){typing_in_input=0;SDL_StopTextInput(window);input_text[0]='\0';in_rom_menu=0;free_rom_list();free_all_rom_list();}
 static void move_selection(int d){if(typing_in_input)return;if(in_rom_menu){if(rom_count>0)selected_rom_index=(selected_rom_index+rom_count+d)%rom_count;}else selected_system_index=(selected_system_index+system_menu_count+d)%system_menu_count;}
+
+static int ensure_mame(void){
+    if(system("command -v mame >/dev/null 2>&1")==0) return 1;
+
+    SDL_Log("MAME not found. Installing it for this system...");
+
+    const char *install_cmd = NULL;
+    if(system("command -v pacman >/dev/null 2>&1")==0){
+        if(system("command -v pkexec >/dev/null 2>&1")==0)
+            install_cmd = "pkexec pacman -S --needed --noconfirm mame";
+        else
+            install_cmd = "sudo pacman -S --needed --noconfirm mame";
+    } else if(system("command -v apt-get >/dev/null 2>&1")==0){
+        if(system("command -v pkexec >/dev/null 2>&1")==0)
+            install_cmd = "pkexec sh -c 'apt-get update && apt-get install -y mame'";
+        else
+            install_cmd = "sudo sh -c 'apt-get update && apt-get install -y mame'";
+    } else if(system("command -v dnf >/dev/null 2>&1")==0){
+        if(system("command -v pkexec >/dev/null 2>&1")==0)
+            install_cmd = "pkexec dnf install -y mame";
+        else
+            install_cmd = "sudo dnf install -y mame";
+    } else {
+        SDL_Log("Could not install MAME automatically: unsupported package manager.");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if(pid == 0){
+        execlp("sh","sh","-c",install_cmd,(char*)NULL);
+        _exit(127);
+    }
+    if(pid < 0){
+        SDL_Log("Could not start MAME installation.");
+        return 0;
+    }
+
+    int status = 0;
+    while(1){
+        pid_t r = waitpid(pid,&status,WNOHANG);
+        if(r == pid) break;
+        if(r < 0){
+            SDL_Log("Error while waiting for MAME installation.");
+            return 0;
+        }
+
+        SDL_Event ev;
+        while(SDL_PollEvent(&ev)){ }
+
+        int w,h;
+        SDL_GetWindowSize(window,&w,&h);
+        SDL_SetRenderDrawColor(renderer,0,0,0,255);
+        SDL_RenderClear(renderer);
+
+        char loading[64];
+        int dots = (int)((SDL_GetTicks()/400)%4);
+        snprintf(loading,sizeof(loading),"Installing MAME%.*s",dots,"...");
+
+        render_text_centered(loading,(float)h/2.0f-20.0f,(SDL_Color){255,255,255,255});
+        render_text_centered("First run only",(float)h/2.0f+15.0f,(SDL_Color){160,160,160,255});
+        SDL_RenderPresent(renderer);
+        SDL_Delay(50);
+    }
+
+    if(!WIFEXITED(status) || WEXITSTATUS(status)!=0){
+        SDL_Log("MAME installation failed.");
+        return 0;
+    }
+
+    if(system("command -v mame >/dev/null 2>&1")!=0){
+        SDL_Log("MAME is still unavailable after installation.");
+        return 0;
+    }
+
+    return 1;
+}
 
 static int launch_pcsx2(const char *rom_path){
     const char *names[] = { "pcsx2-qt", "pcsx2", "PCSX2", "PCSX2-Qt", "PCSX2-qt", NULL };
@@ -348,7 +424,7 @@ static int launch_rpcs3(const char *rom_path){
 }
 
 
-static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else if(!strcmp(sys->mame_sys,"rpcs3")){launch_rpcs3(final);}else{snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
+static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else if(!strcmp(sys->mame_sys,"rpcs3")){launch_rpcs3(final);}else if(ensure_mame()){if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame %s %s",sys->mame_sys,id);}else{snprintf(cmd,sizeof(cmd),"mame %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);}system(cmd);}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
 
 static void handle_events(const SDL_Event*e){if(e->type==SDL_EVENT_TEXT_INPUT&&typing_in_input){size_t left=MAX_INPUT_LENGTH-1-strlen(input_text);if(left){strncat(input_text,e->text.text,left);filter_rom_list();}return;}if(e->type!=SDL_EVENT_KEY_DOWN||e->key.repeat)return;
     if(in_rom_menu&&e->key.key==SDLK_TAB){typing_in_input=!typing_in_input;if(typing_in_input)SDL_StartTextInput(window);else SDL_StopTextInput(window);return;}
