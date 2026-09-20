@@ -2,7 +2,13 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3_ttf/SDL_ttf.h>
+#ifndef ENABLE_BACKGROUND_MUSIC
+#define ENABLE_BACKGROUND_MUSIC 0
+#endif
+
+#if ENABLE_BACKGROUND_MUSIC
 #include <SDL3_mixer/SDL_mixer.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,9 +18,11 @@
 #include <sys/wait.h>
 #include <glob.h>
 
+#if ENABLE_BACKGROUND_MUSIC
 static MIX_Mixer *mixer = NULL;
 static MIX_Audio *music = NULL;
 static MIX_Track *music_track = NULL;
+#endif
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
 static SDL_Texture *logo_texture = NULL;
@@ -31,6 +39,49 @@ static TTF_Font *font = NULL;
 static Uint64 last_input_time = 0;
 static char input_text[MAX_INPUT_LENGTH] = "";
 static int typing_in_input = 0;
+
+
+static void init_background_music(void) {
+#if ENABLE_BACKGROUND_MUSIC
+    if(MIX_Init()) {
+        mixer=MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,NULL);
+        if(mixer){
+            music=MIX_LoadAudio(mixer,"assets/background1.ogg",false);
+            if(music){
+                music_track=MIX_CreateTrack(mixer);
+                if(music_track&&MIX_SetTrackAudio(music_track,music)){
+                    MIX_SetTrackGain(music_track,0.5f);
+                    SDL_PropertiesID p=SDL_CreateProperties();
+                    SDL_SetNumberProperty(p,MIX_PROP_PLAY_LOOPS_NUMBER,-1);
+                    MIX_PlayTrack(music_track,p);
+                    SDL_DestroyProperties(p);
+                }
+            }
+        }
+    }
+#endif
+}
+
+static void pause_background_music(void) {
+#if ENABLE_BACKGROUND_MUSIC
+    if(music_track) MIX_PauseTrack(music_track);
+#endif
+}
+
+static void resume_background_music(void) {
+#if ENABLE_BACKGROUND_MUSIC
+    if(music_track) MIX_ResumeTrack(music_track);
+#endif
+}
+
+static void shutdown_background_music(void) {
+#if ENABLE_BACKGROUND_MUSIC
+    if(music_track) MIX_DestroyTrack(music_track);
+    if(music) MIX_DestroyAudio(music);
+    if(mixer) MIX_DestroyMixer(mixer);
+    MIX_Quit();
+#endif
+}
 
 typedef struct { const char *dir_name; const char *display_name; const char *mame_sys; const char *launch_arg; const char *allowed_exts; } SystemEntry;
 static const SystemEntry systems[] = {
@@ -100,13 +151,13 @@ static void draw_rom_menu(void) {
 }
 
 int main(int argc,char *argv[]) {
-    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_JOYSTICK|SDL_INIT_AUDIO); TTF_Init(); SDL_CreateWindowAndRenderer("Joystick Menu",1024,768,0,&window,&renderer);
+    SDL_Init(SDL_INIT_VIDEO|SDL_INIT_JOYSTICK|SDL_INIT_AUDIO); TTF_Init(); SDL_CreateWindowAndRenderer("Joystick Menu",1024,768,SDL_WINDOW_FULLSCREEN,&window,&renderer); SDL_HideCursor();
     font=TTF_OpenFont("assets/Roboto-Regular.ttf",FONT_SIZE); logo_texture=IMG_LoadTexture(renderer,"assets/logo.png"); background_texture=IMG_LoadTexture(renderer,"assets/background.jpg");
     if(background_texture){SDL_SetTextureBlendMode(background_texture,SDL_BLENDMODE_BLEND);SDL_SetTextureAlphaMod(background_texture,80);}
-    if(MIX_Init()) { mixer=MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,NULL); if(mixer){ music=MIX_LoadAudio(mixer,"assets/background1.ogg",false); if(music){ music_track=MIX_CreateTrack(mixer); if(music_track&&MIX_SetTrackAudio(music_track,music)){MIX_SetTrackGain(music_track,0.5f);SDL_PropertiesID p=SDL_CreateProperties();SDL_SetNumberProperty(p,MIX_PROP_PLAY_LOOPS_NUMBER,-1);MIX_PlayTrack(music_track,p);SDL_DestroyProperties(p);}}}}
+    init_background_music();
     SDL_Event event; int running=1;
     while(running){while(SDL_PollEvent(&event)){if(event.type==SDL_EVENT_QUIT)running=0;if(event.type==SDL_EVENT_JOYSTICK_ADDED)SDL_OpenJoystick(event.jdevice.which);if(event.type==SDL_EVENT_JOYSTICK_REMOVED)SDL_CloseJoystick(SDL_GetJoystickFromID(event.jdevice.which));handle_events(&event);handle_joystick_input(&event);}int w,h;SDL_GetWindowSize(window,&w,&h);SDL_SetRenderDrawColor(renderer,0,0,0,255);SDL_RenderClear(renderer);if(background_texture){SDL_FRect d={0,0,(float)w,(float)h};SDL_RenderTexture(renderer,background_texture,NULL,&d);}if(logo_texture){SDL_FRect d={(w-200)/2.0f,40,200,100};SDL_RenderTexture(renderer,logo_texture,NULL,&d);}if(in_rom_menu)draw_rom_menu();else draw_system_menu();render_text("by MARCO AURELIO SIMAO",10,h-FONT_SIZE-10,(SDL_Color){150,150,150,255});SDL_RenderPresent(renderer);SDL_Delay(16);}
-    free_rom_list();free_all_rom_list();TTF_CloseFont(font);SDL_DestroyTexture(logo_texture);SDL_DestroyTexture(background_texture);if(cover_texture)SDL_DestroyTexture(cover_texture);if(music_track)MIX_DestroyTrack(music_track);if(music)MIX_DestroyAudio(music);if(mixer)MIX_DestroyMixer(mixer);MIX_Quit();TTF_Quit();SDL_Quit();return 0;
+    free_rom_list();free_all_rom_list();TTF_CloseFont(font);SDL_DestroyTexture(logo_texture);SDL_DestroyTexture(background_texture);if(cover_texture)SDL_DestroyTexture(cover_texture);shutdown_background_music();TTF_Quit();SDL_Quit();return 0;
 }
 
 static void render_text_centered(const char *text,float y,SDL_Color color){SDL_Surface*s=TTF_RenderText_Blended(font,text,SDL_strlen(text),color);if(!s)return;SDL_Texture*t=SDL_CreateTextureFromSurface(renderer,s);int tw=s->w,th=s->h;SDL_DestroySurface(s);if(!t)return;int w;SDL_GetWindowSize(window,&w,NULL);SDL_FRect d={(w-tw)/2.0f,y,(float)tw,(float)th};SDL_RenderTexture(renderer,t,NULL,&d);SDL_DestroyTexture(t);}
@@ -434,7 +485,7 @@ static int launch_rpcs3(const char *rom_path){
 }
 
 
-static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode)||(!strcmp(sys->mame_sys,"mame")&&S_ISDIR(st.st_mode)))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;if(music_track)MIX_PauseTrack(music_track);char cmd[2048];if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else if(!strcmp(sys->mame_sys,"rpcs3")){launch_rpcs3(final);}else if(ensure_mame()){if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame -rompath \"./roms;./bios\" %s %s",sys->mame_sys,id);system(cmd);}else if(!strcmp(sys->mame_sys,"mame")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=(d&&S_ISREG(st.st_mode))?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame -rompath \"./roms/arcade;./roms;./bios\" %s -lightgun -lightgun_device mouse",id);system(cmd);}else{snprintf(cmd,sizeof(cmd),"mame -rompath \"./roms;./bios\" %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}}if(music_track)MIX_ResumeTrack(music_track);leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
+static void activate_selection(void){if(typing_in_input)return;if(in_rom_menu){if(!rom_list||rom_count<=0)return;if(!rom_list[selected_rom_index].rom_path){leave_rom_menu();return;}const SystemEntry*sys=&systems[selected_system_index];const char*rp=rom_list[selected_rom_index].rom_path;char final[1024]="";struct stat st;if(stat(rp,&st))return;if(S_ISREG(st.st_mode)||(!strcmp(sys->mame_sys,"mame")&&S_ISDIR(st.st_mode)))snprintf(final,sizeof(final),"%s",rp);if(!final[0])return;pause_background_music();char cmd[2048];if(!strcmp(sys->mame_sys,"pcsx2")){launch_pcsx2(final);}else if(!strcmp(sys->mame_sys,"rpcs3")){launch_rpcs3(final);}else if(ensure_mame()){if(!strcmp(sys->mame_sys,"neogeo")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=d?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame -nowindow -noui_mouse -rompath \"./roms;./bios\" %s %s",sys->mame_sys,id);system(cmd);}else if(!strcmp(sys->mame_sys,"mame")){const char*s=strrchr(final,'/');s=s?s+1:final;const char*d=strrchr(s,'.');char id[256];size_t n=(d&&S_ISREG(st.st_mode))?(size_t)(d-s):strlen(s);if(n>=sizeof(id))n=sizeof(id)-1;memcpy(id,s,n);id[n]='\0';snprintf(cmd,sizeof(cmd),"mame -nowindow -noui_mouse -rompath \"./roms/arcade;./roms;./bios\" %s -lightgun -lightgun_device mouse",id);system(cmd);}else{snprintf(cmd,sizeof(cmd),"mame -rompath \"./roms;./bios\" %s %s \"%s\"",sys->mame_sys,sys->launch_arg,final);system(cmd);}}resume_background_music();leave_rom_menu();return;}if(selected_system_index==system_menu_count-1)exit(0);if(selected_system_index==system_menu_count-2){pid_t p=fork();if(p==0){execl("./cover-scraper","./cover-scraper",(char*)NULL);_exit(1);}if(p>0){int s;waitpid(p,&s,0);}return;}input_text[0]='\0';load_rom_list(&systems[selected_system_index]);in_rom_menu=1;}
 
 static void handle_events(const SDL_Event*e){if(e->type==SDL_EVENT_TEXT_INPUT&&typing_in_input){size_t left=MAX_INPUT_LENGTH-1-strlen(input_text);if(left){strncat(input_text,e->text.text,left);filter_rom_list();}return;}if(e->type!=SDL_EVENT_KEY_DOWN||e->key.repeat)return;
     if(in_rom_menu&&e->key.key==SDLK_TAB){typing_in_input=!typing_in_input;if(typing_in_input)SDL_StartTextInput(window);else SDL_StopTextInput(window);return;}
