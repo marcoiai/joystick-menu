@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDL_PKGS=(sdl3 sdl3-image sdl3-ttf sdl3-mixer)
+ENABLE_MUSIC="${ENABLE_MUSIC:-0}"
+SDL_PKGS=(sdl3 sdl3-image sdl3-ttf)
+if [[ "$ENABLE_MUSIC" == "1" ]]; then
+  SDL_PKGS+=(sdl3-mixer)
+fi
 
 setup_macos_pkg_config() {
   if [[ "$(uname -s)" != "Darwin" ]] || ! command -v brew >/dev/null 2>&1; then
@@ -71,7 +75,7 @@ if ! have_build_deps; then
 fi
 
 echo "Building joystick_menu..."
-gcc joystick_menu.c -o joystick_menu \
+gcc -DENABLE_BACKGROUND_MUSIC="$ENABLE_MUSIC" joystick_menu.c -o joystick_menu \
   $(pkg-config --cflags --libs "${SDL_PKGS[@]}")
 
 echo "Build complete: ./joystick_menu"
