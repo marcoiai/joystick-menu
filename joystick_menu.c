@@ -492,6 +492,42 @@ static void handle_events(const SDL_Event*e){if(e->type==SDL_EVENT_TEXT_INPUT&&t
     if(in_rom_menu&&e->key.key==SDLK_TAB){typing_in_input=!typing_in_input;if(typing_in_input)SDL_StartTextInput(window);else SDL_StopTextInput(window);return;}
     if(typing_in_input){if(e->key.key==SDLK_BACKSPACE&&input_text[0]){size_t n=strlen(input_text);input_text[n-1]='\0';filter_rom_list();}else if(e->key.key==SDLK_RETURN||e->key.key==SDLK_KP_ENTER){typing_in_input=0;SDL_StopTextInput(window);}else if(e->key.key==SDLK_ESCAPE){typing_in_input=0;SDL_StopTextInput(window);input_text[0]='\0';filter_rom_list();}return;}
     switch(e->key.key){case SDLK_UP:move_selection(-1);break;case SDLK_DOWN:move_selection(1);break;case SDLK_RETURN:case SDLK_KP_ENTER:case SDLK_SPACE:activate_selection();break;case SDLK_ESCAPE:if(in_rom_menu)leave_rom_menu();break;default:break;}}
-static void handle_joystick_input(const SDL_Event*e){if(typing_in_input)return;Uint64 now=SDL_GetTicks();if(e->type==SDL_EVENT_JOYSTICK_AXIS_MOTION&&e->jaxis.axis==1){int v=e->jaxis.value;if(v>-AXIS_DEADZONE&&v<AXIS_DEADZONE){joystick_axis_latched=0;return;}if(!joystick_axis_latched&&now>=last_input_time+INPUT_COOLDOWN_MS){int d=v<0?-1:1;move_selection(d);joystick_axis_latched=1;last_input_time=now;}return;}if(e->type==SDL_EVENT_JOYSTICK_BUTTON_DOWN&&e->jbutton.button==0&&now>=last_input_time+INPUT_COOLDOWN_MS){activate_selection();last_input_time=now;}}
+static void handle_joystick_input(const SDL_Event*e){
+    if(typing_in_input)return;
+    Uint64 now=SDL_GetTicks();
+
+    if(e->type==SDL_EVENT_JOYSTICK_HAT_MOTION){
+        if(now<last_input_time+INPUT_COOLDOWN_MS)return;
+        if(e->jhat.value & SDL_HAT_UP){
+            move_selection(-1);
+            last_input_time=now;
+            return;
+        }
+        if(e->jhat.value & SDL_HAT_DOWN){
+            move_selection(1);
+            last_input_time=now;
+            return;
+        }
+    }
+
+    if(e->type==SDL_EVENT_JOYSTICK_AXIS_MOTION&&e->jaxis.axis==1){
+        int v=e->jaxis.value;
+        if(v>-AXIS_DEADZONE&&v<AXIS_DEADZONE){
+            joystick_axis_latched=0;
+            return;
+        }
+        if(!joystick_axis_latched&&now>=last_input_time+INPUT_COOLDOWN_MS){
+            move_selection(v<0?-1:1);
+            joystick_axis_latched=1;
+            last_input_time=now;
+        }
+        return;
+    }
+
+    if(e->type==SDL_EVENT_JOYSTICK_BUTTON_DOWN&&e->jbutton.button==0&&now>=last_input_time+INPUT_COOLDOWN_MS){
+        activate_selection();
+        last_input_time=now;
+    }
+}
 static int file_exists(const char*p){struct stat st;return stat(p,&st)==0;}
 static SDL_Texture*load_cover_for_rom(const char*rp){if(!rp)return NULL;const char*f=strrchr(rp,'/');f=f?f+1:rp;const char*d=strrchr(f,'.');int n=d?(int)(d-f):(int)strlen(f);char p[512];snprintf(p,sizeof(p),"./covers/%.*s.png",n,f);if(file_exists(p)){SDL_Texture*t=IMG_LoadTexture(renderer,p);if(t)return t;}snprintf(p,sizeof(p),"./covers/%.*s.jpg",n,f);return file_exists(p)?IMG_LoadTexture(renderer,p):NULL;}
